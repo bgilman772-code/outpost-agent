@@ -127,6 +127,15 @@ body {
 
 #manual-code-value { display: block; }
 
+.source-link {
+  color: #555;
+  font-size: 0.75rem;
+  text-decoration: none;
+  text-align: center;
+  transition: color 0.15s;
+}
+.source-link:hover { color: #999; }
+
 .relay-url-input {
   width: 100%;
   border: 1.5px solid #e0e0e0;
