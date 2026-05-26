@@ -46,9 +46,22 @@ fn get_status(app: AppHandle, state: State<Mutex<AppState>>) -> AgentStatus {
 const RELAY_URL: &str = env!("VITE_RELAY_URL");
 const BOOTSTRAP_TOKEN: &str = env!("VITE_BOOTSTRAP_TOKEN");
 
-#[tauri::command]
-fn get_agent_token(app: AppHandle) -> String {
-    config::load(&app).token
+fn validate_relay_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Relay URL must use HTTPS (must start with https://)".to_string());
+    }
+    Ok(())
+}
+
+fn validate_pairing_code(code: &str) -> Result<(), String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err("Pairing code is required".to_string());
+    }
+    if code.len() > 64 || !code.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("Invalid pairing code format".to_string());
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -74,8 +87,10 @@ fn get_bootstrap_defaults(app: AppHandle) -> BootstrapDefaults {
 
 #[tauri::command]
 fn update_relay_url(app: AppHandle, url: String) -> Result<(), String> {
+    let url = url.trim().trim_end_matches('/').to_string();
+    validate_relay_url(&url)?;
     let mut cfg = config::load(&app);
-    cfg.relay_url_override = url.trim_end_matches('/').to_string();
+    cfg.relay_url_override = url;
     config::save(&app, &cfg)
 }
 
@@ -85,10 +100,11 @@ async fn pair_with_code(
     state: State<'_, Mutex<AppState>>,
     code: String,
 ) -> Result<AgentStatus, String> {
+    validate_pairing_code(code.trim())?;
     // Relay URL is baked in at build time — user only sees the code field
     let relay_url = RELAY_URL.trim_end_matches('/').to_string();
     let hostname = config::get_hostname();
-    let os = "Windows".to_string();
+    let os = std::env::consts::OS.to_string();
 
     let claim_url = format!("{}/agent/pair/{}/claim", relay_url, code.trim());
     let client = reqwest::Client::new();
@@ -143,7 +159,7 @@ async fn bootstrap_register(
         return Err("This Outpost Agent build is missing its bootstrap token".to_string());
     }
     let hostname = config::get_hostname();
-    let os = "Windows".to_string();
+    let os = std::env::consts::OS.to_string();
 
     let url = format!("{}/agent/bootstrap-register", relay_url.trim_end_matches('/'));
     let client = reqwest::Client::new();
@@ -202,8 +218,10 @@ async fn pair(
     relay_url: String,
     code: String,
 ) -> Result<AgentStatus, String> {
+    validate_relay_url(relay_url.trim())?;
+    validate_pairing_code(code.trim())?;
     let hostname = config::get_hostname();
-    let os = "Windows".to_string();
+    let os = std::env::consts::OS.to_string();
 
     let claim_url = format!(
         "{}/agent/pair/{}/claim",
@@ -319,7 +337,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
-            get_agent_token,
             get_bootstrap_defaults,
             update_relay_url,
             bootstrap_register,
@@ -337,8 +354,6 @@ async fn check_for_update_silently(app: AppHandle) {
     let Ok(updater) = app.updater() else { return };
     let Ok(Some(update)) = updater.check().await else { return };
     eprintln!("[updater] new version available: {}", update.version);
-    // The dialog: true config handles prompting the user
-    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-        eprintln!("[updater] install failed: {e}");
-    }
+    // Notify the frontend and let the user decide — do NOT auto-install silently
+    let _ = app.emit("update_available", update.version.clone());
 }

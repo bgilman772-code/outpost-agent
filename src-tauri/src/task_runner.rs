@@ -23,6 +23,45 @@ pub struct TaskEngine {
     pub is_code_task: bool,
 }
 
+/// Returns true if `path` is within the current user's home directory.
+pub fn is_path_within_home(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    for var in &["USERPROFILE", "HOME"] {
+        if let Ok(home) = std::env::var(var) {
+            if !home.is_empty() && p.starts_with(&home) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns Ok if the endpoint is a loopback address (localhost / 127.0.0.1).
+pub fn validate_ollama_endpoint(endpoint: &str) -> Result<(), String> {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let allowed = trimmed == "http://localhost:11434"
+        || trimmed == "http://localhost"
+        || trimmed == "http://127.0.0.1"
+        || trimmed.starts_with("http://localhost:")
+        || trimmed.starts_with("http://127.0.0.1:");
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "Ollama endpoint must be localhost or 127.0.0.1, got: {endpoint}"
+        ))
+    }
+}
+
+/// Returns Ok if `url` uses a safe git transport (https, ssh, git@).
+fn validate_repo_url(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") || url.starts_with("git@") || url.starts_with("ssh://") {
+        Ok(())
+    } else {
+        Err("Repository URL must use https://, ssh://, or git@ protocol".to_string())
+    }
+}
+
 /// Ensure the project has CLAUDE.md and an outpost-output/ folder before running a task.
 pub fn ensure_project_setup(project_path: &str) {
     let path = std::path::Path::new(project_path);
@@ -135,6 +174,7 @@ fn default_projects_dir() -> std::path::PathBuf {
 /// `repo_url` should be the authenticated HTTPS URL (with token embedded).
 /// Returns the absolute path to the cloned directory.
 pub fn clone_repo(repo_url: &str, name: &str) -> Result<String, String> {
+    validate_repo_url(repo_url)?;
     let base = default_projects_dir();
     std::fs::create_dir_all(&base)
         .map_err(|e| format!("Could not create projects directory: {e}"))?;
@@ -193,6 +233,9 @@ fn run_git_in(args: &[&str], cwd: &str) -> Result<String, String> {
 /// If `github_token` is supplied and the remote is an HTTPS GitHub URL, the
 /// token is embedded for this push only (the stored remote URL is not modified).
 pub fn git_push(project_path: &str, commit_message: &str, github_token: Option<&str>) -> Result<String, String> {
+    if !is_path_within_home(project_path) {
+        return Err("Project path must be within the user's home directory".to_string());
+    }
     let _ = run_git_in(&["add", "-A"], project_path)?;
 
     // Check if there's anything staged
@@ -356,6 +399,13 @@ fn list_child_directories(path: &str) -> Result<DirectoryBrowseResult, String> {
     let base = std::path::PathBuf::from(path);
     if !base.exists() || !base.is_dir() {
         return Err("Directory does not exist".to_string());
+    }
+    // Restrict directory browsing to the user's home directory to prevent full-fs enumeration
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if !home.is_empty() && !base.starts_with(&home) {
+        return Err("Directory browsing is restricted to the user's home directory".to_string());
     }
 
     let mut entries = Vec::new();
@@ -671,16 +721,30 @@ pub fn spawn_task(
         let result = if use_wsl {
             let distro = wsl_distro.as_deref().unwrap_or("Ubuntu");
             let wsl_path = windows_to_wsl_path(&project_path);
-            let model_flag = engine.model_id.as_deref()
-                .filter(|m| !m.is_empty())
-                .map(|m| format!("--model {} ", m))
-                .unwrap_or_default();
-            let cmd = format!(
-                "cd {:?} && claude --print --dangerously-skip-permissions --verbose --output-format stream-json {}{:?}",
-                wsl_path, model_flag, final_prompt
-            );
+            // Use bash positional parameters to avoid shell injection.
+            // The script cd's to $1 then execs the remaining args as the command.
+            // model_id and prompt are passed as argv entries, never interpolated.
+            let mut wsl_args: Vec<String> = vec![
+                "-d".to_string(), distro.to_string(),
+                "--".to_string(),
+                "bash".to_string(), "-c".to_string(),
+                r#"cd "$1" && shift && exec "$@""#.to_string(),
+                "_".to_string(),      // $0 placeholder
+                wsl_path.clone(),     // $1 = directory
+                "claude".to_string(),
+                "--print".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--verbose".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+            ];
+            if let Some(model) = engine.model_id.as_deref().filter(|m| !m.is_empty()) {
+                wsl_args.push("--model".to_string());
+                wsl_args.push(model.to_string());
+            }
+            wsl_args.push(final_prompt.clone());
             let mut wsl_cmd = Command::new("wsl");
-            wsl_cmd.args(["-d", distro, "--", "bash", "-c", &cmd])
+            wsl_cmd.args(&wsl_args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if let Some(key) = engine.api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -783,6 +847,10 @@ fn run_ollama_code_task(
     engine: &TaskEngine,
 ) {
     let endpoint = engine.endpoint.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+    if let Err(e) = validate_ollama_endpoint(&endpoint) {
+        let _ = tx.send(TaskEvent::Error(e));
+        return;
+    }
     let model_id = engine.model_id.clone().unwrap_or_else(|| "llama3.2".to_string());
 
     let _ = tx.send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
@@ -1030,9 +1098,11 @@ fn sanitize_code_path(path: &str, project_path: &str) -> std::path::PathBuf {
     if sanitized.as_os_str().is_empty() {
         sanitized.push("output.txt");
     }
-    // Extra guard: ensure the resolved path stays within the project root
-    let resolved = std::path::Path::new(project_path).join(&sanitized);
-    if !resolved.starts_with(project_path) {
+    // Guard: ensure the resolved path stays within the project root using
+    // Path::starts_with (component-aware, not string prefix) to prevent bypass.
+    let project_root = std::path::Path::new(project_path);
+    let resolved = project_root.join(&sanitized);
+    if !resolved.starts_with(project_root) {
         sanitized = std::path::PathBuf::from("output.txt");
     }
     sanitized
@@ -1045,6 +1115,10 @@ fn run_ollama_task(
     engine: &TaskEngine,
 ) {
     let endpoint = engine.endpoint.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
+    if let Err(e) = validate_ollama_endpoint(&endpoint) {
+        let _ = tx.send(TaskEvent::Error(e));
+        return;
+    }
     let model_id = engine.model_id.clone().unwrap_or_else(|| "llama3.2".to_string());
     let _ = tx.send(TaskEvent::Output { data: "Setting up workspace\n".to_string(), stream: "stdout" });
 

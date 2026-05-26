@@ -72,7 +72,7 @@ pub fn run_probe(hostname: &str) -> ProbeResult {
 
 fn command_exists_win(cmd: &str, arg: &str) -> bool {
     Command::new("cmd")
-        .args(["/C", &format!("{cmd} {arg}")])
+        .args(["/C", cmd, arg])
         .no_window()
         .output()
         .map(|o| o.status.success())
@@ -100,6 +100,22 @@ fn probe_wsl() -> (bool, Vec<String>) {
     }
 }
 
+/// Returns true only if the resolved claude path is in a known-safe location.
+fn is_expected_claude_location(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return false;
+    }
+    for var in &["APPDATA", "LOCALAPPDATA", "PROGRAMFILES", "USERPROFILE"] {
+        if let Ok(dir) = std::env::var(var) {
+            if !dir.is_empty() && p.starts_with(&dir) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn resolve_claude_exe(cmd_path: &str) -> String {
     let cmd_dir = match std::path::Path::new(cmd_path).parent() {
         Some(d) => d.to_path_buf(),
@@ -114,7 +130,7 @@ pub fn resolve_claude_exe(cmd_path: &str) -> String {
         .join("claude-code")
         .join("bin")
         .join("claude.exe");
-    if candidate.exists() {
+    if candidate.exists() && is_expected_claude_location(&candidate.to_string_lossy()) {
         return candidate.to_string_lossy().to_string();
     }
 
@@ -133,7 +149,8 @@ pub fn resolve_claude_exe(cmd_path: &str) -> String {
                     .unwrap_or("")
                     .to_string();
                 let p = std::path::Path::new(&cleaned);
-                if p.exists() {
+                // Validate path is in a known-safe location before trusting it
+                if p.exists() && is_expected_claude_location(&p.to_string_lossy()) {
                     return p.to_string_lossy().to_string();
                 }
             }
