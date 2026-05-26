@@ -666,7 +666,6 @@ pub fn spawn_task(
                 run_ollama_task(&tx, &project_path, &prompt, &engine);
             }
             let _ = tx.send(TaskEvent::Done { exit_code: 0 });
-            eprintln!("[task] {} done via ollama", task_id);
             return;
         }
 
@@ -684,7 +683,6 @@ pub fn spawn_task(
                 }
             }
             let _ = tx.send(TaskEvent::Done { exit_code: 0 });
-            eprintln!("[task] {} done via gemini", task_id);
             return;
         }
 
@@ -708,7 +706,6 @@ pub fn spawn_task(
                 }
             }
             let _ = tx.send(TaskEvent::Done { exit_code: 0 });
-            eprintln!("[task] {} done via {}", task_id, engine.provider_id);
             return;
         }
 
@@ -818,7 +815,6 @@ pub fn spawn_task(
 
         let exit_code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
         let _ = tx.send(TaskEvent::Done { exit_code });
-        eprintln!("[task] {} done, exit={}", task_id, exit_code);
     });
 
     rx
