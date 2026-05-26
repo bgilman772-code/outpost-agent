@@ -88,11 +88,21 @@ async fn run_loop(
             break;
         }
 
+        // Refuse plaintext connections — only wss:// (https://) is permitted
+        if relay_url.starts_with("http://") {
+            wslog!("refusing plaintext ws:// connection; configure an https:// relay URL");
+            let _ = app.emit("connection_state", ConnState::Disconnected);
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                _ = stop.changed() => { break; }
+            }
+            continue;
+        }
+
         let _ = app.emit("connection_state", ConnState::Connecting);
 
         let ws_url = relay_url
             .replace("https://", "wss://")
-            .replace("http://", "ws://")
             .trim_end_matches('/')
             .to_string()
             + "/agent";
@@ -244,10 +254,12 @@ async fn handle_text_message(
 
         Some("setup_project") => {
             let path = msg["path"].as_str().unwrap_or("").to_string();
-            if !path.is_empty() {
+            if !path.is_empty() && crate::task_runner::is_path_within_home(&path) {
                 tokio::task::spawn_blocking(move || {
                     crate::task_runner::ensure_project_setup(&path);
                 });
+            } else if !path.is_empty() {
+                wslog!("setup_project: rejected path outside home directory: {}", path);
             }
         }
 
@@ -365,6 +377,16 @@ async fn handle_text_message(
             let model_id = msg["modelId"].as_str().unwrap_or("").to_string();
             let endpoint = msg["endpoint"].as_str().unwrap_or("http://localhost:11434").to_string();
             if request_id.is_empty() || model_id.is_empty() {
+                return;
+            }
+            if let Err(e) = crate::task_runner::validate_ollama_endpoint(&endpoint) {
+                wslog!("setup_ollama: rejected endpoint: {}", e);
+                let write2 = write.clone();
+                let _ = write2.lock().await.send(Message::Text(serde_json::json!({
+                    "type": "ollama_setup_error",
+                    "requestId": request_id,
+                    "error": e,
+                }).to_string().into())).await;
                 return;
             }
 

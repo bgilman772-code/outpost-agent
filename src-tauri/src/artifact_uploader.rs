@@ -135,12 +135,19 @@ async fn upload_one(
     let filename = path.file_name()?.to_str()?.to_string();
     let bytes = tokio::fs::read(path).await.ok()?;
 
+    // Send only the project directory name (not the full local path) to avoid
+    // leaking the user's filesystem layout and username to the relay server.
+    let project_name = std::path::Path::new(project_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(project_path);
+
     let base = relay_url.trim_end_matches('/');
     let upload_url = format!("{base}/artifacts/upload");
     eprintln!("[artifacts] uploading {} to {}", filename, upload_url);
     let send_result = client
         .post(&upload_url)
-        .query(&[("taskId", task_id), ("projectPath", project_path)])
+        .query(&[("taskId", task_id), ("projectPath", project_name)])
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/octet-stream")
         .header("X-Filename", urlencoded_filename(&filename))
