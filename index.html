@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Outpost Agent</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="view-pair" class="view hidden">
+      <div class="logo">Outpost Agent</div>
+      <p class="subtitle">
+        On your iPhone, open Outpost and scan this QR code to connect your computer.
+      </p>
+
+      <div id="qr-panel" class="qr-panel">
+        <div id="qr-loading" class="qr-loading">
+          <div class="spinner"></div>
+          <p>Preparing secure setup…</p>
+        </div>
+        <canvas id="qr-canvas" class="hidden"></canvas>
+      </div>
+
+      <p id="qr-status" class="qr-status">Scan with your iPhone to connect this computer.</p>
+
+      <button id="btn-refresh-qr" class="secondary">Refresh QR code</button>
+
+      <button id="btn-toggle-manual" class="ghost small">Use pairing code instead</button>
+
+      <div id="manual-panel" class="manual-panel hidden">
+        <p class="manual-label">Pairing code</p>
+        <p class="subtitle compact">
+          If you prefer not to scan, open <strong>Add PC</strong> on your iPhone and enter this code there.
+        </p>
+        <div class="manual-code-box">
+          <span id="manual-code-value">----</span>
+        </div>
+      </div>
+
+      <button id="btn-toggle-relay" class="ghost small">Change relay URL</button>
+
+      <div id="relay-panel" class="manual-panel hidden">
+        <p class="manual-label">Relay URL</p>
+        <p class="subtitle compact">
+          Paste the current cloudflared tunnel URL here if the QR code fails to load.
+        </p>
+        <input id="relay-url-input" type="text" class="relay-url-input" placeholder="https://…" />
+        <button id="btn-save-relay" class="secondary small">Save &amp; Refresh QR</button>
+      </div>
+
+      <p id="pair-error" class="error hidden"></p>
+    </div>
+
+    <div id="view-connected" class="view hidden">
+      <div class="status-row">
+        <span id="conn-dot" class="dot connecting"></span>
+        <span id="conn-label">Connecting…</span>
+      </div>
+      <div class="hostname" id="connected-hostname"></div>
+      <div class="machine-id" id="connected-id"></div>
+      <button id="btn-unpair" class="danger small">Unpair this PC</button>
+    </div>
+  </body>
+</html>

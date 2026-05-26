@@ -1,0 +1,200 @@
+:root {
+  font-family: Inter, -apple-system, Helvetica, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #1a1a1a;
+  background: #f5f5f5;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 32px;
+}
+
+.view {
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.hidden { display: none !important; }
+
+.logo {
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: #111;
+}
+
+.subtitle {
+  color: #555;
+  font-size: 0.9rem;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.subtitle.compact {
+  font-size: 0.82rem;
+}
+
+.qr-panel {
+  width: 100%;
+  background: #fff;
+  border: 1px solid #e7e2d8;
+  border-radius: 18px;
+  padding: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 260px;
+}
+
+.qr-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: #666;
+  font-size: 0.88rem;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid #d7e5ff;
+  border-top-color: #396cd8;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+#qr-canvas {
+  width: 220px;
+  height: 220px;
+}
+
+.qr-status {
+  color: #555;
+  font-size: 0.86rem;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.manual-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #ebe5da;
+}
+
+.manual-label {
+  color: #888;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.manual-code-box {
+  width: 100%;
+  border: 2px solid #e0e0e0;
+  border-radius: 12px;
+  padding: 14px 16px;
+  font-size: 1.6rem;
+  font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-align: center;
+  text-transform: uppercase;
+  background: #fff;
+  color: #111;
+}
+
+#manual-code-value { display: block; }
+
+.relay-url-input {
+  width: 100%;
+  border: 1.5px solid #e0e0e0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 0.85rem;
+  font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+  background: #fff;
+  color: #111;
+  outline: none;
+}
+.relay-url-input:focus { border-color: #396cd8; }
+
+button {
+  width: 100%;
+  border: none;
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: inherit;
+  background: #396cd8;
+  color: #fff;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+button:hover:not(:disabled) { opacity: 0.88; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.danger { background: #fee2e2; color: #b91c1c; width: auto; padding: 8px 16px; font-size: 0.82rem; }
+button.small { width: auto; }
+button.secondary { background: #ecf2ff; color: #244ca8; }
+button.ghost { background: transparent; color: #666; padding: 8px 12px; }
+
+.error { color: #b91c1c; font-size: 0.85rem; text-align: center; }
+
+/* Connected */
+.status-row { display: flex; align-items: center; gap: 8px; }
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.online    { background: #22c55e; }
+.dot.connecting { background: #f59e0b; animation: pulse 1.4s infinite; }
+.dot.offline   { background: #ef4444; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.hostname { font-size: 1.1rem; font-weight: 700; color: #111; }
+.machine-id { font-size: 0.75rem; font-family: monospace; color: #999; }
+
+@media (prefers-color-scheme: dark) {
+  :root { color: #f0f0f0; background: #1a1a1a; }
+  .logo { color: #f0f0f0; }
+  .subtitle { color: #aaa; }
+  .qr-panel { background: #232323; border-color: #3a3a3a; }
+  .qr-loading, .qr-status, .manual-label { color: #aaa; }
+  .manual-code-box { background: #2a2a2a; border-color: #444; color: #f0f0f0; }
+  .hostname { color: #f0f0f0; }
+  button.danger { background: #3a1a1a; color: #f87171; }
+  button.secondary { background: #1e2c4b; color: #b9d0ff; }
+  button.ghost { color: #bbb; }
+  .manual-panel { border-top-color: #3a3a3a; }
+  .relay-url-input { background: #2a2a2a; border-color: #444; color: #f0f0f0; }
+  .relay-url-input:focus { border-color: #6b9fff; }
+}
