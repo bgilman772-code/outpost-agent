@@ -8,54 +8,53 @@
     <script type="module" src="/src/main.ts" defer></script>
   </head>
   <body>
+    <!-- ── First-time pairing view ───────────────────────────────────────── -->
     <div id="view-pair" class="view hidden">
       <div class="logo">Outpost Agent</div>
+
       <p class="subtitle">
-        On your iPhone, open Outpost and scan this QR code to connect your computer.
+        Connect your iPhone to this computer.
       </p>
 
-      <div id="qr-panel" class="qr-panel">
-        <div id="qr-loading" class="qr-loading">
-          <div class="spinner"></div>
-          <p>Preparing secure setup…</p>
-        </div>
-        <canvas id="qr-canvas" class="hidden"></canvas>
+      <ol class="instructions">
+        <li>Open <strong>Outpost</strong> on your iPhone.</li>
+        <li>Tap <strong>Add PC</strong> and copy the code shown.</li>
+        <li>Paste or type that code below.</li>
+      </ol>
+
+      <div class="code-entry-panel">
+        <input
+          id="pair-code-input"
+          type="text"
+          class="code-input"
+          placeholder="Enter code from iPhone"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          maxlength="64"
+        />
+        <button id="btn-connect" class="primary">Connect</button>
       </div>
 
-      <p id="qr-status" class="qr-status">Scan with your iPhone to connect this computer.</p>
-
-      <button id="btn-refresh-qr" class="secondary">Refresh QR code</button>
-
-      <button id="btn-toggle-manual" class="ghost small">Use pairing code instead</button>
-
-      <div id="manual-panel" class="manual-panel hidden">
-        <p class="manual-label">Pairing code</p>
-        <p class="subtitle compact">
-          If you prefer not to scan, open <strong>Add PC</strong> on your iPhone and enter this code there.
-        </p>
-        <div class="manual-code-box">
-          <span id="manual-code-value">----</span>
-        </div>
-      </div>
+      <p id="pair-error" class="error hidden"></p>
 
       <button id="btn-toggle-relay" class="ghost small">Change relay URL</button>
 
       <div id="relay-panel" class="manual-panel hidden">
         <p class="manual-label">Relay URL</p>
         <p class="subtitle compact">
-          Paste the current cloudflared tunnel URL here if the QR code fails to load.
+          Paste your relay's URL here if you self-host at a custom address.
         </p>
         <input id="relay-url-input" type="text" class="relay-url-input" placeholder="https://…" />
-        <button id="btn-save-relay" class="secondary small">Save &amp; Refresh QR</button>
+        <button id="btn-save-relay" class="secondary small">Save</button>
       </div>
-
-      <p id="pair-error" class="error hidden"></p>
 
       <a class="source-link" href="https://github.com/bgilman772-code/outpost-agent" target="_blank" rel="noopener">
         View source on GitHub
       </a>
     </div>
 
+    <!-- ── Connected view (after pairing) ───────────────────────────────── -->
     <div id="view-connected" class="view hidden">
       <div class="status-row">
         <span id="conn-dot" class="dot connecting"></span>
@@ -63,7 +62,37 @@
       </div>
       <div class="hostname" id="connected-hostname"></div>
       <div class="machine-id" id="connected-id"></div>
+
+      <!-- QR code for the phone to (re-)link to this machine -->
+      <div id="qr-panel" class="qr-panel">
+        <div id="qr-loading" class="qr-loading">
+          <div class="spinner"></div>
+          <p>Preparing QR…</p>
+        </div>
+        <canvas id="qr-canvas" class="hidden"></canvas>
+      </div>
+      <p id="qr-status" class="qr-status">Scan with your iPhone to connect.</p>
+
+      <div id="manual-panel" class="manual-panel">
+        <p class="manual-label compact">Pairing code</p>
+        <div class="manual-code-box">
+          <span id="manual-code-value">----</span>
+        </div>
+      </div>
+
+      <button id="btn-refresh-qr" class="secondary small">Refresh QR</button>
       <button id="btn-unpair" class="danger small">Unpair this PC</button>
+
+      <!-- Approval requests panel (shown only when a dangerous action needs sign-off) -->
+      <div id="approval-panel" class="approval-panel hidden">
+        <p class="approval-title">⚠ Action requires approval</p>
+        <div id="approval-description" class="approval-description"></div>
+        <div class="approval-buttons">
+          <button id="btn-approve" class="primary small">Allow</button>
+          <button id="btn-deny" class="danger small">Deny</button>
+        </div>
+        <p class="approval-hint">Auto-denied in <span id="approval-countdown">30</span>s</p>
+      </div>
     </div>
   </body>
 </html>
