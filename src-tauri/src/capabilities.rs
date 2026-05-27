@@ -10,7 +10,7 @@ pub enum Capability {
     GitRead,
     GitWrite,
     ArtifactUpload,
-    ClaudeExecution,
+    AIExecution,
     NetworkAccess,
 }
 
@@ -23,7 +23,7 @@ impl std::fmt::Display for Capability {
             Self::GitRead         => "git_read",
             Self::GitWrite        => "git_write",
             Self::ArtifactUpload  => "artifact_upload",
-            Self::ClaudeExecution => "claude_execution",
+            Self::AIExecution     => "ai_execution",
             Self::NetworkAccess   => "network_access",
         };
         write!(f, "{s}")
@@ -42,7 +42,7 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
     static CREATE_PROJECT: &[Capability] = &[FilesystemWrite];
     static CLONE_REPO:     &[Capability] = &[FilesystemWrite, NetworkAccess, GitRead, GitWrite];
     static GIT_PUSH:       &[Capability] = &[FilesystemRead, GitRead, GitWrite, NetworkAccess];
-    static RUN_TASK:       &[Capability] = &[FilesystemRead, FilesystemWrite, ShellExecute, ClaudeExecution, ArtifactUpload];
+    static RUN_TASK:       &[Capability] = &[FilesystemRead, FilesystemWrite, ShellExecute, AIExecution, ArtifactUpload];
     static SETUP_OLLAMA:   &[Capability] = &[FilesystemWrite, NetworkAccess, ShellExecute];
 
     match msg_type {
@@ -132,7 +132,7 @@ mod tests {
     fn test_run_task_has_required_capabilities() {
         let caps = message_capabilities("run_task").unwrap();
         assert!(caps.contains(&Capability::ShellExecute));
-        assert!(caps.contains(&Capability::ClaudeExecution));
+        assert!(caps.contains(&Capability::AIExecution));
         assert!(caps.contains(&Capability::FilesystemWrite));
         assert!(caps.contains(&Capability::ArtifactUpload));
     }
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(Capability::GitRead.to_string(),         "git_read");
         assert_eq!(Capability::GitWrite.to_string(),        "git_write");
         assert_eq!(Capability::ArtifactUpload.to_string(),  "artifact_upload");
-        assert_eq!(Capability::ClaudeExecution.to_string(), "claude_execution");
+        assert_eq!(Capability::AIExecution.to_string(),     "ai_execution");
         assert_eq!(Capability::NetworkAccess.to_string(),   "network_access");
     }
 

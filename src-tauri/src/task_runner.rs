@@ -99,7 +99,8 @@ fn session_memory_path(project_path: &str) -> std::path::PathBuf {
 
 fn write_session_memory(project_path: &str, session_memory: &str) -> Result<std::path::PathBuf, String> {
     let path = session_memory_path(project_path);
-    std::fs::write(&path, session_memory)
+    let redacted = redact_secrets(session_memory);
+    std::fs::write(&path, redacted)
         .map_err(|e| format!("Could not write session memory: {e}"))?;
     Ok(path)
 }
@@ -126,6 +127,70 @@ New user request:\n{}",
         }
     }
     format!("{code_session_rules}{prompt}")
+}
+
+fn redact_secrets(input: &str) -> String {
+    let mut out = input.to_string();
+    const DIRECT_PATTERNS: &[&str] = &[
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN DSA PRIVATE KEY-----",
+        "-----BEGIN PRIVATE KEY-----",
+    ];
+    for marker in DIRECT_PATTERNS {
+        if out.contains(marker) {
+            out = out.replace(marker, "[REDACTED_PRIVATE_KEY]");
+        }
+    }
+
+    // Redact common provider token prefixes by tokenizing on whitespace and quotes.
+    let mut rebuilt = String::with_capacity(out.len());
+    for part in out.split_inclusive(char::is_whitespace) {
+        let trimmed = part.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c.is_whitespace());
+        let lower = trimmed.to_lowercase();
+        let should_redact = lower.starts_with("sk-ant-")
+            || lower.starts_with("sk-proj-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("gho_")
+            || lower.starts_with("ghs_")
+            || lower.starts_with("ghr_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")
+            || lower.starts_with("xoxa-")
+            || lower.starts_with("xoxr-")
+            || looks_like_aws_access_key(trimmed)
+            || looks_like_jwt(trimmed);
+        if should_redact {
+            let suffix = if part.ends_with(char::is_whitespace) {
+                part.chars().rev().take_while(|c| c.is_whitespace()).collect::<String>().chars().rev().collect::<String>()
+            } else {
+                String::new()
+            };
+            rebuilt.push_str("[REDACTED_SECRET]");
+            rebuilt.push_str(&suffix);
+        } else {
+            rebuilt.push_str(part);
+        }
+    }
+    rebuilt
+}
+
+fn looks_like_aws_access_key(token: &str) -> bool {
+    let t = token.trim();
+    if t.len() != 20 || !t.starts_with("AKIA") {
+        return false;
+    }
+    t[4..].chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+fn looks_like_jwt(token: &str) -> bool {
+    let t = token.trim().trim_matches('.');
+    let parts: Vec<&str> = t.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts.iter().all(|p| p.len() >= 8 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
 }
 
 /// Create a new project folder and set it up with CLAUDE.md + outpost-output/.
@@ -214,6 +279,7 @@ pub fn clone_repo(repo_url: &str, name: &str) -> Result<String, String> {
 }
 
 fn run_git_in(args: &[&str], cwd: &str) -> Result<String, String> {
+    validate_git_command(args)?;
     #[allow(unused_mut)]
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(cwd);
@@ -227,6 +293,32 @@ fn run_git_in(args: &[&str], cwd: &str) -> Result<String, String> {
         return Err(format!("{stdout}{stderr}").trim().to_string());
     }
     Ok(format!("{stdout}{stderr}"))
+}
+
+fn validate_git_command(args: &[&str]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("Git command denied: empty args".to_string());
+    }
+    let allowed = match args[0] {
+        "add" => args.len() == 2 && args[1] == "-A",
+        "diff" => args.len() == 3 && args[1] == "--cached" && args[2] == "--quiet",
+        "commit" => args.len() == 3 && args[1] == "-m" && !args[2].trim().is_empty(),
+        "remote" => args.len() == 3 && args[1] == "get-url" && args[2] == "origin",
+        "push" => {
+            if args.len() == 1 {
+                true
+            } else if args.len() == 2 {
+                !args[1].starts_with('-')
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if !allowed {
+        return Err(format!("Git command denied by policy: {:?}", args));
+    }
+    Ok(())
 }
 
 /// Commit all changed files and push to the configured git remote.
@@ -659,6 +751,8 @@ pub fn spawn_task(
     }
 
     std::thread::spawn(move || {
+        let prompt = redact_secrets(&prompt);
+        let session_memory = session_memory.map(|value| redact_secrets(&value));
         if engine.provider_id == "ollama" {
             if engine.is_code_task {
                 run_ollama_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine);
@@ -730,6 +824,11 @@ pub fn spawn_task(
                 wsl_path.clone(),     // $1 = directory
                 "claude".to_string(),
                 "--print".to_string(),
+                // Required: claude --print does not grant tool permissions automatically.
+                // Without this flag, every tool call (Write, Bash, etc.) requires interactive
+                // approval that can never arrive in a headless subprocess — tasks would hang
+                // or produce no output. The agent's validate_git_command / validate_generated_file
+                // / capability checks are the actual security boundary here.
                 "--dangerously-skip-permissions".to_string(),
                 "--verbose".to_string(),
                 "--output-format".to_string(),
@@ -750,6 +849,10 @@ pub fn spawn_task(
             wsl_cmd.spawn()
         } else {
             let model_str = engine.model_id.clone().unwrap_or_default();
+            // --dangerously-skip-permissions is required: without it, claude --print hangs
+            // waiting for interactive permission grants that never arrive in a headless
+            // subprocess. Security is enforced by validate_git_command, validate_generated_file,
+            // and the capability system — not by Claude's permission prompts.
             let mut claude_args: Vec<&str> = vec!["--print", "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json"];
             if !model_str.is_empty() {
                 claude_args.push("--model");
@@ -1007,6 +1110,10 @@ Rules:\n\
     for file in &files {
         let sanitized = sanitize_code_path(&file.path, project_path);
         let full_path = std::path::Path::new(project_path).join(&sanitized);
+        if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+            let _ = tx.send(TaskEvent::Error(reason));
+            return;
+        }
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1153,6 +1260,10 @@ fn run_ollama_task(
             for file in files {
                 let sanitized = sanitize_output_path(&file.path);
                 let full_path = output_root.join(&sanitized);
+                if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+                    let _ = tx.send(TaskEvent::Error(reason));
+                    return;
+                }
                 if let Some(parent) = full_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -1382,6 +1493,10 @@ Rules:\n\
                     for file in files {
                         let sanitized = sanitize_output_path(&file.path);
                         let full_path = output_root.join(&sanitized);
+                        if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+                            let _ = tx.send(TaskEvent::Error(reason));
+                            return;
+                        }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
                             let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
@@ -1488,6 +1603,10 @@ Rules:\n\
                     for file in &files {
                         let sanitized = sanitize_code_path(&file.path, project_path);
                         let full_path = std::path::Path::new(project_path).join(&sanitized);
+                        if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+                            let _ = tx.send(TaskEvent::Error(reason));
+                            return;
+                        }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
                             let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
@@ -1607,6 +1726,10 @@ Rules:\n\
                     for file in files {
                         let sanitized = sanitize_output_path(&file.path);
                         let full_path = output_root.join(&sanitized);
+                        if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+                            let _ = tx.send(TaskEvent::Error(reason));
+                            return;
+                        }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
                             let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
@@ -1710,6 +1833,10 @@ Rules:\n\
                     for file in &files {
                         let sanitized = sanitize_code_path(&file.path, project_path);
                         let full_path = std::path::Path::new(project_path).join(&sanitized);
+                        if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
+                            let _ = tx.send(TaskEvent::Error(reason));
+                            return;
+                        }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
                             let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
@@ -1741,6 +1868,61 @@ fn sanitize_output_path(path: &str) -> std::path::PathBuf {
         sanitized.push("deliverable.txt");
     }
     sanitized
+}
+
+fn validate_generated_file(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("generated file")
+        .to_string();
+    let lower = content.to_lowercase();
+
+    // Unambiguously malicious execution/download patterns only.
+    // Do NOT add generic subprocess primitives (os.system, subprocess.popen,
+    // child_process.exec) — those are standard library calls used in countless
+    // legitimate scripts and would produce constant false positives.
+    const DANGEROUS_PATTERNS: &[(&str, &str)] = &[
+        ("curl|bash",          "detected pipe-to-shell downloader"),
+        ("curl | bash",        "detected pipe-to-shell downloader"),
+        ("wget|bash",          "detected pipe-to-shell downloader"),
+        ("wget | bash",        "detected pipe-to-shell downloader"),
+        ("invoke-expression",  "detected PowerShell dynamic execution"),
+        ("iex(",               "detected PowerShell dynamic execution"),
+        ("powershell -enc",    "detected encoded PowerShell execution"),
+        ("frombase64string(",  "detected possible obfuscated payload decode"),
+    ];
+
+    for (needle, reason) in DANGEROUS_PATTERNS {
+        if lower.contains(needle) {
+            return Err(format!(
+                "Blocked write for {}: {}",
+                filename, reason
+            ));
+        }
+    }
+
+    // Block credential-harvesting path targets in generated code.
+    // Keep this list specific — broad markers like ".config/" produce false positives
+    // on any config-directory reference in legitimate code.
+    const SENSITIVE_PATH_MARKERS: &[&str] = &[
+        ".ssh/",
+        ".aws/credentials",
+        "appdata/local/google/chrome/user data",
+        "appdata/roaming/mozilla/firefox/profiles",
+        "/etc/shadow",
+        "/etc/passwd",
+    ];
+    for marker in SENSITIVE_PATH_MARKERS {
+        if lower.contains(marker) {
+            return Err(format!(
+                "Blocked write for {}: references sensitive credential path ({})",
+                filename, marker
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse a stream-json event line into a human-readable string for the phone UI.
@@ -1815,5 +1997,61 @@ fn windows_to_wsl_path(path: &str) -> String {
         format!("/mnt/{drive}{rest}")
     } else {
         path.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_generated_file_allows_normal_content() {
+        let path = std::path::Path::new("notes.md");
+        let content = "Project summary and normal implementation details.";
+        assert!(validate_generated_file(path, content).is_ok());
+    }
+
+    #[test]
+    fn validate_generated_file_blocks_pipe_to_shell() {
+        let path = std::path::Path::new("script.sh");
+        let content = "curl|bash https://example.com/install.sh";
+        assert!(validate_generated_file(path, content).is_err());
+    }
+
+    #[test]
+    fn validate_generated_file_blocks_sensitive_path_reference() {
+        let path = std::path::Path::new("stealer.py");
+        let content = "open('/etc/shadow').read()";
+        assert!(validate_generated_file(path, content).is_err());
+    }
+
+    #[test]
+    fn validate_generated_file_allows_common_subprocess_calls() {
+        let path = std::path::Path::new("script.py");
+        let content = "import subprocess\nresult = subprocess.Popen(['ls', '-la'])\nimport os\nos.system('make build')";
+        assert!(validate_generated_file(path, content).is_ok());
+    }
+
+    #[test]
+    fn redact_secrets_masks_known_tokens() {
+        let raw = "token sk-ant-api03-abc123 and jwt abcdefgh.ijklmnop.qrstuvwx";
+        let redacted = redact_secrets(raw);
+        assert!(!redacted.contains("sk-ant-api03-abc123"));
+        assert!(redacted.contains("[REDACTED_SECRET]"));
+        assert!(redacted.contains("[REDACTED_SECRET]") || redacted.contains("[REDACTED_JWT]"));
+    }
+
+    #[test]
+    fn validate_git_policy_allows_expected_commands() {
+        assert!(validate_git_command(&["add", "-A"]).is_ok());
+        assert!(validate_git_command(&["commit", "-m", "msg"]).is_ok());
+        assert!(validate_git_command(&["push"]).is_ok());
+    }
+
+    #[test]
+    fn validate_git_policy_blocks_unexpected_commands() {
+        assert!(validate_git_command(&["reset", "--hard"]).is_err());
+        assert!(validate_git_command(&["push", "--force"]).is_err());
+        assert!(validate_git_command(&["clean", "-fd"]).is_err());
     }
 }

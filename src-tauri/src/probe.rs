@@ -1,4 +1,6 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -116,6 +118,52 @@ fn is_expected_claude_location(path: &str) -> bool {
     false
 }
 
+fn sha256_file_hex(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn is_trusted_binary(path: &str, env_key: &str) -> bool {
+    let p = Path::new(path);
+    if !p.exists() || !is_expected_claude_location(path) {
+        return false;
+    }
+
+    // Optional strict trust mode: require SHA256 to match an allowlist.
+    // Set env_key (e.g. CLAUDE_TRUSTED_SHA256, OLLAMA_TRUSTED_SHA256)
+    // to a comma-separated list of lowercase hashes.
+    let expected = std::env::var(env_key).unwrap_or_default();
+    if expected.trim().is_empty() {
+        return true;
+    }
+    let actual = match sha256_file_hex(p) {
+        Some(h) => h,
+        None => return false,
+    };
+    expected
+        .split(',')
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .any(|hash| hash == actual)
+}
+
+fn is_trusted_claude_binary(path: &str) -> bool {
+    is_trusted_binary(path, "CLAUDE_TRUSTED_SHA256")
+}
+
+fn is_trusted_ollama_binary(path: &str) -> bool {
+    is_trusted_binary(path, "OLLAMA_TRUSTED_SHA256")
+}
+
 pub fn resolve_claude_exe(cmd_path: &str) -> String {
     let cmd_dir = match std::path::Path::new(cmd_path).parent() {
         Some(d) => d.to_path_buf(),
@@ -181,7 +229,9 @@ fn probe_claude(wsl_distros: &[String]) -> (bool, String) {
                 } else {
                     path
                 };
-                return (true, resolved);
+                if is_trusted_claude_binary(&resolved) {
+                    return (true, resolved);
+                }
             }
         }
     }
@@ -219,7 +269,10 @@ fn probe_ollama() -> (bool, String) {
                 .trim()
                 .to_string();
             if !path.is_empty() {
-                return (true, path);
+                if is_trusted_ollama_binary(&path) {
+                    return (true, path);
+                }
+                return (false, String::new());
             }
         }
     }
@@ -230,7 +283,7 @@ fn probe_ollama() -> (bool, String) {
             .join("Programs")
             .join("Ollama")
             .join("ollama.exe");
-        if candidate.exists() {
+        if candidate.exists() && is_trusted_ollama_binary(&candidate.to_string_lossy()) {
             return (true, candidate.to_string_lossy().to_string());
         }
     }
@@ -334,4 +387,22 @@ fn scan_projects() -> Vec<ProjectInfo> {
     projects.sort_by(|a, b| a.name.cmp(&b.name));
     projects.dedup_by(|a, b| a.path == b.path);
     projects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_file_hex_matches_known_value() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("probe_sha256_test_{}.txt", std::process::id()));
+        std::fs::write(&p, b"hello").expect("write temp file");
+        let digest = sha256_file_hex(&p).expect("hash temp file");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(
+            digest,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
 }
