@@ -665,16 +665,31 @@ async fn dispatch_action(
 
             let write2 = write.clone();
             tokio::spawn(async move {
+                let proj = project_path.clone();
+                let msg_clone = commit_message.clone();
+                let tok_clone = github_token.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::task_runner::git_push(&project_path, &commit_message, github_token.as_deref())
+                    crate::task_runner::git_push(&proj, &msg_clone, tok_clone.as_deref())
                 }).await.unwrap_or_else(|_| Err("Git push panicked".to_string()));
 
                 let response = match result {
-                    Ok(output) => serde_json::json!({
-                        "type": "git_push_result",
-                        "pushId": push_id,
-                        "output": output,
-                    }),
+                    Ok(output) => {
+                        // After a successful push, try to open/find a GitHub PR.
+                        let pr_url = if let Some(token) = &github_token {
+                            create_or_find_github_pr(&project_path, &commit_message, token).await
+                        } else {
+                            None
+                        };
+                        let mut v = serde_json::json!({
+                            "type": "git_push_result",
+                            "pushId": push_id,
+                            "output": output,
+                        });
+                        if let Some(url) = pr_url {
+                            v["prUrl"] = serde_json::Value::String(url);
+                        }
+                        v
+                    }
                     Err(e) => serde_json::json!({
                         "type": "git_push_error",
                         "pushId": push_id,
@@ -819,4 +834,101 @@ async fn dispatch_action(
 
         _ => {}
     }
+}
+
+// ── GitHub PR creation ────────────────────────────────────────────────────────
+
+/// After a successful push, try to find an existing open PR for the current
+/// branch or create a new one. Returns the HTML URL on success, None on any
+/// error (network, auth, already up-to-date branch, etc.) — the push itself
+/// is not affected.
+async fn create_or_find_github_pr(project_path: &str, commit_message: &str, token: &str) -> Option<String> {
+    // We need the remote URL and current branch — do both as blocking calls.
+    let (remote_url, current_branch, default_branch) = tokio::task::spawn_blocking({
+        let p = project_path.to_string();
+        move || {
+            let remote = crate::task_runner::run_git_readonly(&["remote", "get-url", "origin"], &p)
+                .unwrap_or_default();
+            let branch = crate::task_runner::run_git_readonly(&["symbolic-ref", "--short", "HEAD"], &p)
+                .unwrap_or_default();
+            // Determine default branch: try `git remote show origin`'s HEAD, fall back to "main".
+            let default = crate::task_runner::run_git_readonly(
+                &["symbolic-ref", "refs/remotes/origin/HEAD"], &p,
+            )
+            .map(|s| s.trim().trim_start_matches("refs/remotes/origin/").to_string())
+            .unwrap_or_else(|_| "main".to_string());
+            (remote.trim().to_string(), branch.trim().to_string(), default.trim().to_string())
+        }
+    }).await.ok()?;
+
+    // Only works for GitHub HTTPS remotes.
+    if !remote_url.starts_with("https://") || !remote_url.contains("github.com") {
+        return None;
+    }
+    // Don't open a PR if head == base (pushing to default branch).
+    if current_branch.is_empty() || current_branch == default_branch {
+        return None;
+    }
+
+    let (owner, repo) = parse_github_owner_repo(&remote_url)?;
+
+    let client = crate::tls_pinning::get_pinned_http_client();
+    let api_base = format!("https://api.github.com/repos/{owner}/{repo}");
+    let auth_header = format!("Bearer {}", token);
+
+    // Check if a PR already exists for this head branch.
+    let list_resp = client
+        .get(format!("{api_base}/pulls?state=open&head={owner}:{current_branch}&per_page=1"))
+        .header("Authorization", &auth_header)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "outpost-agent/0.1")
+        .send().await.ok()?;
+
+    if list_resp.status().is_success() {
+        let items: serde_json::Value = list_resp.json().await.ok()?;
+        if let Some(url) = items[0]["html_url"].as_str() {
+            return Some(url.to_string()); // PR already exists
+        }
+    }
+
+    // Derive a PR title from the commit message (first line, max 72 chars).
+    let title: String = commit_message.lines().next().unwrap_or("Outpost changes")
+        .chars().take(72).collect();
+
+    let body = serde_json::json!({
+        "title": title,
+        "head": current_branch,
+        "base": default_branch,
+        "body": "Created automatically by Outpost after a commit & push.",
+    });
+
+    let create_resp = client
+        .post(format!("{api_base}/pulls"))
+        .header("Authorization", &auth_header)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "outpost-agent/0.1")
+        .json(&body)
+        .send().await.ok()?;
+
+    if create_resp.status().is_success() {
+        let pr: serde_json::Value = create_resp.json().await.ok()?;
+        pr["html_url"].as_str().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse `https://github.com/owner/repo.git` → `("owner", "repo")`.
+fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    let path = url.trim_end_matches(".git")
+        .trim_end_matches('/')
+        .split("github.com/")
+        .nth(1)?;
+    let mut parts = path.splitn(2, '/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() { return None; }
+    Some((owner, repo))
 }

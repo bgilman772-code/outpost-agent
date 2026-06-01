@@ -1080,7 +1080,7 @@ pub fn spawn_task(
                     match line {
                         Ok(l) if l.trim().is_empty() => continue,
                         Ok(l) => {
-                            if let Some(msg) = format_stream_event(&l) {
+                            for msg in format_stream_events(&l) {
                                 if !msg.trim().is_empty() {
                                     let _ = tx2.blocking_send(TaskEvent::Output { data: msg + "\n", stream: "stdout" });
                                 }
@@ -2122,21 +2122,38 @@ fn validate_generated_file(path: &std::path::Path, content: &str) -> Result<(), 
     Ok(())
 }
 
-/// Parse a stream-json event line into a human-readable string for the phone UI.
-/// Returns None to skip the event silently.
-fn format_stream_event(line: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+/// Parse a stream-json event line into zero or more human-readable transcript
+/// steps for the phone UI. Each returned string is one logical step (assistant
+/// prose, a thinking block, a tool call, or a tool result) so the phone can
+/// render them as distinct rows instead of one merged blob.
+///
+/// Tool calls keep the `[ToolName] summary` convention. Thinking blocks and tool
+/// results use the `[Thinking]` / `[ToolResult]` / `[ToolError]` markers, which
+/// the phone styles distinctly. Older phones that don't recognise the markers
+/// degrade gracefully — they just render the text as a plain line.
+fn format_stream_events(line: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
 
-    match v["type"].as_str()? {
+    let mut parts: Vec<String> = Vec::new();
+    match v["type"].as_str().unwrap_or("") {
         "assistant" => {
-            let content = v["message"]["content"].as_array()?;
-            let mut parts: Vec<String> = Vec::new();
+            let Some(content) = v["message"]["content"].as_array() else {
+                return parts;
+            };
             for item in content {
                 match item["type"].as_str().unwrap_or("") {
                     "text" => {
                         let text = item["text"].as_str().unwrap_or("").trim();
                         if !text.is_empty() {
                             parts.push(text.to_string());
+                        }
+                    }
+                    "thinking" => {
+                        let text = item["thinking"].as_str().unwrap_or("").trim();
+                        if !text.is_empty() {
+                            parts.push(format!("[Thinking] {}", collapse_ws(text, 280)));
                         }
                     }
                     "tool_use" => {
@@ -2151,11 +2168,59 @@ fn format_stream_event(line: &str) -> Option<String> {
                     _ => {}
                 }
             }
-            if parts.is_empty() { None } else { Some(parts.join("\n")) }
+        }
+        // Tool results come back as `user`-role messages in stream-json. These
+        // carry what a command actually printed / what a read returned — the most
+        // valuable "what is going on" signal, previously dropped entirely.
+        "user" => {
+            let Some(content) = v["message"]["content"].as_array() else {
+                return parts;
+            };
+            for item in content {
+                if item["type"].as_str().unwrap_or("") != "tool_result" {
+                    continue;
+                }
+                let is_error = item["is_error"].as_bool().unwrap_or(false);
+                let preview = collapse_ws(&extract_tool_result_text(&item["content"]), 300);
+                if preview.is_empty() {
+                    continue;
+                }
+                let marker = if is_error { "ToolError" } else { "ToolResult" };
+                parts.push(format!("[{}] {}", marker, preview));
+            }
         }
         // "result" is intentionally omitted — its text duplicates the last assistant event
-        _ => None,
+        _ => {}
     }
+    parts
+}
+
+/// Flatten newlines/runs of whitespace into single spaces and truncate, so a
+/// multi-line tool result or thinking block renders as a tidy one-line preview.
+fn collapse_ws(s: &str, max_chars: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(&collapsed, max_chars)
+}
+
+/// A tool_result's `content` is either a plain string or an array of
+/// `{ "type": "text", "text": "..." }` blocks. Normalise both to a string.
+fn extract_tool_result_text(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut out = String::new();
+        for item in arr {
+            if let Some(t) = item["text"].as_str() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+    String::new()
 }
 
 /// Summarize the input of a tool call for display in the phone UI.
@@ -2207,6 +2272,12 @@ pub struct GitChanges {
 
 /// Run a git command for internal read-only use. Not routed through the relay
 /// capability or validation system — only called from collect_git_changes.
+/// Public alias used by ws_client for lightweight read-only git queries
+/// (remote URL, current branch, etc.) outside the capability system.
+pub fn run_git_readonly(args: &[&str], cwd: &str) -> Result<String, String> {
+    run_raw_git(args, cwd)
+}
+
 fn run_raw_git(args: &[&str], cwd: &str) -> Result<String, String> {
     #[allow(unused_mut)]
     let mut cmd = std::process::Command::new("git");
@@ -2348,5 +2419,39 @@ mod tests {
         assert!(validate_git_command(&["reset", "--hard"]).is_err());
         assert!(validate_git_command(&["push", "--force"]).is_err());
         assert!(validate_git_command(&["clean", "-fd"]).is_err());
+    }
+
+    #[test]
+    fn stream_events_emits_thinking_and_tool_call_as_separate_steps() {
+        let line = r#"{"type":"assistant","message":{"content":[
+            {"type":"thinking","thinking":"Let me inspect the file first."},
+            {"type":"tool_use","name":"Read","input":{"file_path":"src/main.rs"}}
+        ]}}"#;
+        let steps = format_stream_events(line);
+        assert_eq!(steps.len(), 2);
+        assert!(steps[0].starts_with("[Thinking] Let me inspect"));
+        assert_eq!(steps[1], "[Read] src/main.rs");
+    }
+
+    #[test]
+    fn stream_events_surfaces_tool_results_from_user_messages() {
+        let ok = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"line one\nline two"}
+        ]}}"#;
+        let steps = format_stream_events(ok);
+        assert_eq!(steps, vec!["[ToolResult] line one line two".to_string()]);
+
+        let err = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t1","is_error":true,
+             "content":[{"type":"text","text":"command not found"}]}
+        ]}}"#;
+        let steps = format_stream_events(err);
+        assert_eq!(steps, vec!["[ToolError] command not found".to_string()]);
+    }
+
+    #[test]
+    fn stream_events_ignores_unrelated_event_types() {
+        assert!(format_stream_events(r#"{"type":"result","subtype":"success"}"#).is_empty());
+        assert!(format_stream_events("not json").is_empty());
     }
 }
