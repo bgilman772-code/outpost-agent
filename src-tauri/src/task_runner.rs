@@ -253,19 +253,27 @@ fn redact_secrets(input: &str) -> String {
     let mut rebuilt = String::with_capacity(out.len());
     for part in out.split_inclusive(char::is_whitespace) {
         let trimmed = part.trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c.is_whitespace());
-        let lower = trimmed.to_lowercase();
-        let should_redact = lower.starts_with("sk-ant-")
-            || lower.starts_with("sk-proj-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("gho_")
-            || lower.starts_with("ghs_")
-            || lower.starts_with("ghr_")
-            || lower.starts_with("xoxb-")
-            || lower.starts_with("xoxp-")
-            || lower.starts_with("xoxa-")
-            || lower.starts_with("xoxr-")
-            || looks_like_aws_access_key(trimmed)
-            || looks_like_jwt(trimmed);
+        // Also consider the value side of `KEY=value` / `KEY:value` assignments,
+        // since `printenv` / `.env` output (e.g. `GITHUB_TOKEN=ghp_…`) puts the
+        // secret after the prefix rather than at the start of the token.
+        let value_candidate = trimmed.rsplit(|c| c == '=' || c == ':').next().unwrap_or(trimmed);
+        let matches_secret = |s: &str| {
+            let lower = s.to_lowercase();
+            lower.starts_with("sk-ant-")
+                || lower.starts_with("sk-proj-")
+                || lower.starts_with("ghp_")
+                || lower.starts_with("gho_")
+                || lower.starts_with("ghs_")
+                || lower.starts_with("ghr_")
+                || lower.starts_with("github_pat_")
+                || lower.starts_with("xoxb-")
+                || lower.starts_with("xoxp-")
+                || lower.starts_with("xoxa-")
+                || lower.starts_with("xoxr-")
+                || looks_like_aws_access_key(s)
+                || looks_like_jwt(s)
+        };
+        let should_redact = matches_secret(trimmed) || matches_secret(value_candidate);
         if should_redact {
             let suffix = if part.ends_with(char::is_whitespace) {
                 part.chars().rev().take_while(|c| c.is_whitespace()).collect::<String>().chars().rev().collect::<String>()
@@ -2192,7 +2200,12 @@ fn format_stream_events(line: &str) -> Vec<String> {
         // "result" is intentionally omitted — its text duplicates the last assistant event
         _ => {}
     }
-    parts
+    // Redact secrets from every transcript line before it leaves the agent.
+    // Tool results (command output) and thinking blocks can contain tokens —
+    // e.g. a task that runs `printenv` — and this stream is forwarded to the
+    // relay/phone and persisted in chat history, so it must be scrubbed like
+    // the prompt and session memory are.
+    parts.into_iter().map(|p| redact_secrets(&p)).collect()
 }
 
 /// Flatten newlines/runs of whitespace into single spaces and truncate, so a
@@ -2202,25 +2215,27 @@ fn collapse_ws(s: &str, max_chars: usize) -> String {
     truncate(&collapsed, max_chars)
 }
 
-/// A tool_result's `content` is either a plain string or an array of
-/// `{ "type": "text", "text": "..." }` blocks. Normalise both to a string.
+/// A tool_result's `content` is either a plain string or an array of content
+/// blocks. Normalise both to a string: text blocks contribute their text,
+/// non-text blocks (e.g. images) contribute a `[type]` placeholder so adjacent
+/// text isn't silently concatenated across a dropped block.
 fn extract_tool_result_text(content: &serde_json::Value) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
-    if let Some(arr) = content.as_array() {
-        let mut out = String::new();
-        for item in arr {
+    let Some(arr) = content.as_array() else {
+        return String::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
             if let Some(t) = item["text"].as_str() {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(t);
+                Some(t.to_string())
+            } else {
+                item["type"].as_str().map(|kind| format!("[{kind}]"))
             }
-        }
-        return out;
-    }
-    String::new()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Summarize the input of a tool call for display in the phone UI.
@@ -2453,5 +2468,18 @@ mod tests {
     fn stream_events_ignores_unrelated_event_types() {
         assert!(format_stream_events(r#"{"type":"result","subtype":"success"}"#).is_empty());
         assert!(format_stream_events("not json").is_empty());
+    }
+
+    #[test]
+    fn stream_events_redacts_secrets_in_tool_results() {
+        // A tool result that printed an env var with a token must be scrubbed
+        // before it leaves the agent toward the relay/phone/history.
+        let line = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"t1","content":"GITHUB_TOKEN=ghp_abcdefgh1234567890ABCD"}
+        ]}}"#;
+        let steps = format_stream_events(line);
+        assert_eq!(steps.len(), 1);
+        assert!(!steps[0].contains("ghp_abcdefgh1234567890ABCD"), "token leaked: {}", steps[0]);
+        assert!(steps[0].contains("[REDACTED_SECRET]"));
     }
 }

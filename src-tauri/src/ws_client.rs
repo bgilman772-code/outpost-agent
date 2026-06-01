@@ -843,21 +843,15 @@ async fn dispatch_action(
 /// error (network, auth, already up-to-date branch, etc.) — the push itself
 /// is not affected.
 async fn create_or_find_github_pr(project_path: &str, commit_message: &str, token: &str) -> Option<String> {
-    // We need the remote URL and current branch — do both as blocking calls.
-    let (remote_url, current_branch, default_branch) = tokio::task::spawn_blocking({
+    // Read the remote URL and current branch (blocking git calls).
+    let (remote_url, current_branch) = tokio::task::spawn_blocking({
         let p = project_path.to_string();
         move || {
             let remote = crate::task_runner::run_git_readonly(&["remote", "get-url", "origin"], &p)
                 .unwrap_or_default();
             let branch = crate::task_runner::run_git_readonly(&["symbolic-ref", "--short", "HEAD"], &p)
                 .unwrap_or_default();
-            // Determine default branch: try `git remote show origin`'s HEAD, fall back to "main".
-            let default = crate::task_runner::run_git_readonly(
-                &["symbolic-ref", "refs/remotes/origin/HEAD"], &p,
-            )
-            .map(|s| s.trim().trim_start_matches("refs/remotes/origin/").to_string())
-            .unwrap_or_else(|_| "main".to_string());
-            (remote.trim().to_string(), branch.trim().to_string(), default.trim().to_string())
+            (remote.trim().to_string(), branch.trim().to_string())
         }
     }).await.ok()?;
 
@@ -865,24 +859,46 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
     if !remote_url.starts_with("https://") || !remote_url.contains("github.com") {
         return None;
     }
-    // Don't open a PR if head == base (pushing to default branch).
-    if current_branch.is_empty() || current_branch == default_branch {
+    if current_branch.is_empty() {
         return None;
     }
 
     let (owner, repo) = parse_github_owner_repo(&remote_url)?;
 
-    let client = crate::tls_pinning::get_pinned_http_client();
+    // GitHub API calls must NOT use the relay-pinned client — that client pins
+    // the relay's SPKI and would reject api.github.com's certificate. Use a
+    // standard client with native roots instead.
+    let client = github_api_client();
     let api_base = format!("https://api.github.com/repos/{owner}/{repo}");
     let auth_header = format!("Bearer {}", token);
+    let send = |req: reqwest::RequestBuilder| {
+        req.header("Authorization", &auth_header)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "outpost-agent/0.1")
+    };
 
-    // Check if a PR already exists for this head branch.
-    let list_resp = client
-        .get(format!("{api_base}/pulls?state=open&head={owner}:{current_branch}&per_page=1"))
-        .header("Authorization", &auth_header)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "outpost-agent/0.1")
+    // Resolve the repository's real default branch (don't guess "main").
+    let repo_resp = send(client.get(&api_base)).send().await.ok()?;
+    if !repo_resp.status().is_success() {
+        return None;
+    }
+    let repo_info: serde_json::Value = repo_resp.json().await.ok()?;
+    let default_branch = repo_info["default_branch"].as_str().unwrap_or("main").to_string();
+
+    // Don't open a PR when pushing straight to the default branch.
+    if current_branch == default_branch {
+        return None;
+    }
+
+    // Check for an existing open PR for this head branch. Query params are passed
+    // via .query() so branch names with '/', '#', etc. are percent-encoded.
+    let list_resp = send(client.get(format!("{api_base}/pulls")))
+        .query(&[
+            ("state", "open"),
+            ("head", &format!("{owner}:{current_branch}")),
+            ("per_page", "1"),
+        ])
         .send().await.ok()?;
 
     if list_resp.status().is_success() {
@@ -903,12 +919,7 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
         "body": "Created automatically by Outpost after a commit & push.",
     });
 
-    let create_resp = client
-        .post(format!("{api_base}/pulls"))
-        .header("Authorization", &auth_header)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", "outpost-agent/0.1")
+    let create_resp = send(client.post(format!("{api_base}/pulls")))
         .json(&body)
         .send().await.ok()?;
 
@@ -918,6 +929,19 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
     } else {
         None
     }
+}
+
+/// A standard (non-pinned) HTTPS client for GitHub API calls. The pinned client
+/// is reserved for relay-bound traffic; GitHub presents its own certificate
+/// chain validated against the system/native roots.
+fn github_api_client() -> &'static reqwest::Client {
+    static GITHUB_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    GITHUB_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Parse `https://github.com/owner/repo.git` → `("owner", "repo")`.
