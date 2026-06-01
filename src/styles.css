@@ -46,6 +46,36 @@ body {
   font-size: 0.82rem;
 }
 
+.instructions {
+  width: 100%;
+  padding-left: 18px;
+  color: #555;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+
+.code-entry-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.code-input {
+  width: 100%;
+  border: 1.5px solid #e0e0e0;
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 1rem;
+  font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+  text-transform: uppercase;
+  background: #fff;
+  color: #111;
+  outline: none;
+}
+
+.code-input:focus { border-color: #396cd8; }
+
 .qr-panel {
   width: 100%;
   background: #fff;
@@ -80,7 +110,8 @@ body {
   to { transform: rotate(360deg); }
 }
 
-#qr-canvas {
+#qr-canvas,
+#setup-qr-canvas {
   width: 220px;
   height: 220px;
 }
@@ -199,6 +230,9 @@ button.ghost { background: transparent; color: #666; padding: 8px 12px; }
   .qr-panel { background: #232323; border-color: #3a3a3a; }
   .qr-loading, .qr-status, .manual-label { color: #aaa; }
   .manual-code-box { background: #2a2a2a; border-color: #444; color: #f0f0f0; }
+  .instructions { color: #aaa; }
+  .code-input { background: #2a2a2a; border-color: #444; color: #f0f0f0; }
+  .code-input:focus { border-color: #6b9fff; }
   .hostname { color: #f0f0f0; }
   button.danger { background: #3a1a1a; color: #f87171; }
   button.secondary { background: #1e2c4b; color: #b9d0ff; }

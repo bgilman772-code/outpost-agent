@@ -13,16 +13,35 @@
       <div class="logo">Outpost Agent</div>
 
       <p class="subtitle">
-        Connect your iPhone to this computer.
+        Scan this code from Outpost on your iPhone.
       </p>
 
       <ol class="instructions">
         <li>Open <strong>Outpost</strong> on your iPhone.</li>
-        <li>Tap <strong>Add PC</strong> and copy the code shown.</li>
-        <li>Paste or type that code below.</li>
+        <li>Tap <strong>Add PC</strong>.</li>
+        <li>Scan the QR code below or enter the pairing code.</li>
       </ol>
 
-      <div class="code-entry-panel">
+      <div class="qr-panel">
+        <div id="setup-qr-loading" class="qr-loading">
+          <div class="spinner"></div>
+          <p>Preparing QR...</p>
+        </div>
+        <canvas id="setup-qr-canvas" class="hidden"></canvas>
+      </div>
+      <p id="setup-qr-status" class="qr-status">Preparing secure pairing...</p>
+
+      <div class="manual-panel">
+        <p class="manual-label compact">Pairing code</p>
+        <div class="manual-code-box">
+          <span id="setup-manual-code-value">----</span>
+        </div>
+      </div>
+
+      <button id="btn-refresh-setup-qr" class="secondary small">Refresh QR</button>
+      <button id="btn-show-phone-code" class="ghost small">Enter code from iPhone instead</button>
+
+      <div id="phone-code-panel" class="code-entry-panel hidden">
         <input
           id="pair-code-input"
           type="text"

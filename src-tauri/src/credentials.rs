@@ -110,7 +110,7 @@ pub async fn rotate_token(relay_url: &str) -> Result<String, String> {
         .ok_or_else(|| "no refresh token stored; re-pair required".to_string())?;
 
     let url = format!("{}/auth/refresh", relay_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = crate::tls_pinning::get_pinned_http_client();
     let resp = client
         .post(&url)
         .json(&serde_json::json!({ "refreshToken": refresh }))

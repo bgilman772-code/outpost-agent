@@ -14,6 +14,90 @@ pub enum TaskEvent {
     Error(String),
 }
 
+// ── Task cancellation registry ────────────────────────────────────────────────
+// Maps an in-flight task_id to a cancel flag (+ child PID for the CLI path) so a
+// `cancel_task` message from the phone can stop a running task.
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct TaskHandle {
+    cancel: Arc<AtomicBool>,
+    pid: Option<u32>,
+}
+
+fn task_registry() -> &'static Mutex<std::collections::HashMap<String, TaskHandle>> {
+    static REG: OnceLock<Mutex<std::collections::HashMap<String, TaskHandle>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_task(task_id: &str) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    task_registry()
+        .lock()
+        .unwrap()
+        .insert(task_id.to_string(), TaskHandle { cancel: cancel.clone(), pid: None });
+    cancel
+}
+
+fn set_task_pid(task_id: &str, pid: u32) {
+    if let Some(h) = task_registry().lock().unwrap().get_mut(task_id) {
+        h.pid = Some(pid);
+    }
+}
+
+fn unregister_task(task_id: &str) {
+    task_registry().lock().unwrap().remove(task_id);
+}
+
+/// Request cancellation of a running task. Sets its cancel flag and, for the CLI
+/// (Claude/Codex) path, kills the child process tree. Returns true if the task
+/// was known/running.
+pub fn cancel_task(task_id: &str) -> bool {
+    let entry = task_registry()
+        .lock()
+        .unwrap()
+        .get(task_id)
+        .map(|h| (h.cancel.clone(), h.pid));
+    match entry {
+        Some((cancel, pid)) => {
+            cancel.store(true, Ordering::SeqCst);
+            if let Some(pid) = pid {
+                kill_process_tree(pid);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+fn kill_process_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Graceful TERM, then a KILL shortly after in case it ignores TERM.
+        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).spawn();
+        let pid_str = pid.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = Command::new("kill").args(["-KILL", &pid_str]).spawn();
+        });
+    }
+}
+
+/// RAII guard that unregisters a task when the worker thread exits by any path.
+struct TaskGuard(String);
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        unregister_task(&self.0);
+    }
+}
+
 #[derive(Clone)]
 pub struct TaskEngine {
     pub provider_id: String,
@@ -93,6 +177,22 @@ pub fn ensure_project_setup(project_path: &str) {
     }
 }
 
+/// Read project-specific agent instructions from AGENTS.md in the project root.
+/// This mirrors Codex's AGENTS.md convention — a file where developers describe
+/// how to work on the project (test commands, coding standards, key files, etc.).
+fn load_project_instructions(project_path: &str) -> Option<String> {
+    for filename in &["AGENTS.md", "OUTPOST.md"] {
+        let path = std::path::Path::new(project_path).join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let trimmed = content.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 fn session_memory_path(project_path: &str) -> std::path::PathBuf {
     std::path::Path::new(project_path).join(".outpost-session-memory.md")
 }
@@ -105,17 +205,22 @@ fn write_session_memory(project_path: &str, session_memory: &str) -> Result<std:
     Ok(path)
 }
 
-fn compose_code_task_prompt(prompt: &str, session_memory: Option<&str>) -> String {
+fn compose_code_task_prompt(prompt: &str, session_memory: Option<&str>, project_path: &str) -> String {
     let code_session_rules = "You are in an Outpost code session.\n\
-- Treat this as in-place project work, not a deliverables task.\n\
-- Prefer editing existing project files or adding normal project files inside the codebase.\n\
-- Do not create review artifacts, reports, summaries, exports, or files in `outpost-output/` unless the user explicitly asks for a downloadable deliverable.\n\
-- If the user asks you to inspect, explain, check, or answer something, respond through the session and avoid generating standalone files.\n\n";
+- Treat this as in-place project work: edit existing project files or add new files directly in the codebase.\n\
+- If the user asks you to output, export, download, send to phone, create a report, generate a document, produce a mockup, or deliver any standalone file — you MUST save the finished file(s) into the `outpost-output/` directory in the project root. This directory already exists. The Outpost mobile app only surfaces files saved there, so a deliverable saved anywhere else will not reach the user.\n\
+- This applies to every deliverable, including multi-file outputs (e.g. a website's .html/.css/.js, or a report plus its images): write the complete, final set of files into `outpost-output/`. Do not leave them in the project root, a temp folder, or a new subfolder elsewhere.\n\
+- For all other requests (edits, inspections, explanations, analysis, answers), work in-place and respond through the session. Do not create files in `outpost-output/` for those.\n\n";
+
+    // Inject AGENTS.md / OUTPOST.md project instructions if present.
+    let agents_prefix = load_project_instructions(project_path)
+        .map(|instructions| format!("Project instructions (AGENTS.md):\n{}\n\n", instructions))
+        .unwrap_or_default();
 
     if let Some(memory) = session_memory {
         if !memory.trim().is_empty() {
             return format!(
-                "{code_session_rules}You are continuing an existing Outpost coding session.\n\
+                "{code_session_rules}{agents_prefix}You are continuing an existing Outpost coding session.\n\
 The file `.outpost-session-memory.md` in the project root has been refreshed with recent session context.\n\
 Use that memory as authoritative context for follow-up references and continue the same thread unless the user explicitly changes direction.\n\
 Do not ask the user to restate prior context unless there is true ambiguity.\n\n\
@@ -126,7 +231,7 @@ New user request:\n{}",
             );
         }
     }
-    format!("{code_session_rules}{prompt}")
+    format!("{code_session_rules}{agents_prefix}{prompt}")
 }
 
 fn redact_secrets(input: &str) -> String {
@@ -346,25 +451,12 @@ pub fn git_push(project_path: &str, commit_message: &str, github_token: Option<&
 
     let commit_out = run_git_in(&["commit", "-m", commit_message], project_path)?;
 
-    // Build authenticated push URL if a token was provided
     let push_out = if let Some(token) = github_token {
-        // Get the current origin URL
         let remote_url = run_git_in(&["remote", "get-url", "origin"], project_path)
             .unwrap_or_default();
         let remote_url = remote_url.trim();
-
-        // Only embed token for HTTPS GitHub URLs
-        let auth_url = if remote_url.starts_with("https://") && remote_url.contains("github.com") {
-            // Strip any existing embedded credentials: https://anything@github.com → https://github.com
-            let clean = regex_strip_creds(remote_url);
-            // Insert token: https://token@github.com/...
-            Some(clean.replacen("https://", &format!("https://{}@", token), 1))
-        } else {
-            None
-        };
-
-        if let Some(url) = auth_url {
-            run_git_in(&["push", &url], project_path)?
+        if remote_url.starts_with("https://") && remote_url.contains("github.com") {
+            run_git_push_authenticated(token, remote_url, project_path)?
         } else {
             run_git_in(&["push"], project_path)?
         }
@@ -373,6 +465,67 @@ pub fn git_push(project_path: &str, commit_message: &str, github_token: Option<&
     };
 
     Ok(format!("{commit_out}\n{push_out}").trim().to_string())
+}
+
+/// Push to a GitHub HTTPS remote using GIT_ASKPASS so the token is never part
+/// of the git command's argument list (visible via /proc/PID/cmdline or ps).
+fn run_git_push_authenticated(token: &str, remote_url: &str, project_path: &str) -> Result<String, String> {
+    let clean = regex_strip_creds(remote_url);
+
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    #[cfg(unix)]
+    let (script_path, script_content) = {
+        let p = tmp_dir.join(format!("git-askpass-{pid}-{ts}.sh"));
+        let escaped = token.replace('\'', "'\\''");
+        let c = format!("#!/bin/sh\necho '{}'\n", escaped);
+        (p, c)
+    };
+    #[cfg(not(unix))]
+    let (script_path, script_content) = {
+        let p = tmp_dir.join(format!("git-askpass-{pid}-{ts}.bat"));
+        let escaped = token.replace('%', "%%");
+        let c = format!("@echo off\r\necho {}\r\n", escaped);
+        (p, c)
+    };
+
+    std::fs::write(&script_path, script_content.as_bytes())
+        .map_err(|e| format!("failed to write askpass helper: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("failed to chmod askpass helper: {e}"))?;
+    }
+
+    let script_str = script_path.to_string_lossy().to_string();
+
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("git");
+    cmd.args(["push", &clean])
+        .current_dir(project_path)
+        .env("GIT_ASKPASS", &script_str)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output()
+        .map_err(|e| format!("git push failed to start: {e}"))?;
+
+    let _ = std::fs::remove_file(&script_path);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        return Err(format!("{stdout}{stderr}").trim().to_string());
+    }
+    Ok(format!("{stdout}{stderr}"))
 }
 
 /// Strip embedded credentials from an HTTPS URL: https://user:pass@host → https://host
@@ -742,24 +895,34 @@ pub fn spawn_task(
     use_wsl: bool,
     wsl_distro: Option<String>,
     claude_path: String,
-) -> mpsc::UnboundedReceiver<TaskEvent> {
-    let (tx, rx) = mpsc::unbounded_channel();
+    extra_env: std::collections::HashMap<String, String>,
+) -> mpsc::Receiver<TaskEvent> {
+    // Bounded so a very chatty task (e.g. a build dumping megabytes to stdout)
+    // can't grow memory without limit when the WSS consumer is slower than the
+    // producer. blocking_send on the reader threads applies backpressure all the
+    // way down to the child process's stdout pipe, which is the desired behavior.
+    let (tx, rx) = mpsc::channel(512);
 
     ensure_project_setup(&project_path);
     if let Some(memory) = session_memory.as_deref() {
         let _ = write_session_memory(&project_path, memory);
     }
 
+    // Register this task so a `cancel_task` message can stop it. The guard inside
+    // the worker thread unregisters it on every exit path.
+    let cancel = register_task(&task_id);
+
     std::thread::spawn(move || {
+        let _guard = TaskGuard(task_id.clone());
         let prompt = redact_secrets(&prompt);
         let session_memory = session_memory.map(|value| redact_secrets(&value));
         if engine.provider_id == "ollama" {
             if engine.is_code_task {
-                run_ollama_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine);
+                run_ollama_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine, &cancel);
             } else {
                 run_ollama_task(&tx, &project_path, &prompt, &engine);
             }
-            let _ = tx.send(TaskEvent::Done { exit_code: 0 });
+            let _ = tx.blocking_send(TaskEvent::Done { exit_code: 0 });
             return;
         }
 
@@ -767,16 +930,16 @@ pub fn spawn_task(
             match engine.api_key.as_deref() {
                 Some(key) if !key.is_empty() => {
                     if engine.is_code_task {
-                        run_gemini_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine, key);
+                        run_gemini_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine, key, &cancel);
                     } else {
                         run_gemini_task(&tx, &project_path, &prompt, &engine, key);
                     }
                 }
                 _ => {
-                    let _ = tx.send(TaskEvent::Error("Gemini API key not configured. Add it in Profile > AI Engine.".to_string()));
+                    let _ = tx.blocking_send(TaskEvent::Error("Gemini API key not configured. Add it in Profile > AI Engine.".to_string()));
                 }
             }
-            let _ = tx.send(TaskEvent::Done { exit_code: 0 });
+            let _ = tx.blocking_send(TaskEvent::Done { exit_code: 0 });
             return;
         }
 
@@ -790,21 +953,21 @@ pub fn spawn_task(
             match engine.api_key.as_deref() {
                 Some(key) if !key.is_empty() => {
                     if engine.is_code_task {
-                        run_openai_compat_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine, key, base_url, default_model);
+                        run_openai_compat_code_task(&tx, &project_path, &prompt, session_memory.as_deref(), &engine, key, base_url, default_model, &cancel);
                     } else {
                         run_openai_compat_task(&tx, &project_path, &prompt, &engine, key, base_url, default_model);
                     }
                 }
                 _ => {
-                    let _ = tx.send(TaskEvent::Error(format!("{} API key not configured. Add it in Profile > AI Engine.", display_name)));
+                    let _ = tx.blocking_send(TaskEvent::Error(format!("{} API key not configured. Add it in Profile > AI Engine.", display_name)));
                 }
             }
-            let _ = tx.send(TaskEvent::Done { exit_code: 0 });
+            let _ = tx.blocking_send(TaskEvent::Done { exit_code: 0 });
             return;
         }
 
         let final_prompt = if engine.is_code_task {
-            compose_code_task_prompt(&prompt, session_memory.as_deref())
+            compose_code_task_prompt(&prompt, session_memory.as_deref(), &project_path)
         } else {
             prompt.clone()
         };
@@ -846,6 +1009,9 @@ pub fn spawn_task(
             if let Some(key) = engine.api_key.as_deref().filter(|k| !k.is_empty()) {
                 wsl_cmd.env("ANTHROPIC_API_KEY", key);
             }
+            for (k, v) in &extra_env {
+                wsl_cmd.env(k, v);
+            }
             wsl_cmd.spawn()
         } else {
             let model_str = engine.model_id.clone().unwrap_or_default();
@@ -853,20 +1019,42 @@ pub fn spawn_task(
             // waiting for interactive permission grants that never arrive in a headless
             // subprocess. Security is enforced by validate_git_command, validate_generated_file,
             // and the capability system — not by Claude's permission prompts.
-            let mut claude_args: Vec<&str> = vec!["--print", "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json"];
+            let mut claude_args: Vec<String> = vec![
+                "--print".into(),
+                "--dangerously-skip-permissions".into(),
+                "--verbose".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ];
             if !model_str.is_empty() {
-                claude_args.push("--model");
-                claude_args.push(&model_str);
+                claude_args.push("--model".into());
+                claude_args.push(model_str.clone());
             }
-            claude_args.push(&final_prompt);
+            claude_args.push(final_prompt.clone());
+
+            // Wrap in cmd /c to give Claude Code a proper interactive shell session.
+            // Claude's internal shell runner calls CreateProcessAsUserW when spawning
+            // bash subprocesses; this fails with ERROR_NO_SUCH_LOGON_SESSION (1312) if
+            // the process was not started inside a real cmd session with a valid token.
             #[allow(unused_mut)]
-            let mut cmd = Command::new(&claude_path);
-            cmd.args(&claude_args)
+            let mut cmd = Command::new("cmd");
+            // Build: cmd /c ""<claude_path>" <args...>"
+            // The outer quotes are required by cmd /c when the path contains spaces.
+            let inner: String = std::iter::once(format!("\"{}\"", claude_path))
+                .chain(claude_args.iter().map(|a| {
+                    if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }
+                }))
+                .collect::<Vec<_>>()
+                .join(" ");
+            cmd.args(["/c", &format!("\"{}\"", inner)])
                 .current_dir(&project_path)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             if let Some(key) = engine.api_key.as_deref().filter(|k| !k.is_empty()) {
                 cmd.env("ANTHROPIC_API_KEY", key);
+            }
+            for (k, v) in &extra_env {
+                cmd.env(k, v);
             }
             #[cfg(target_os = "windows")]
             cmd.creation_flags(CREATE_NO_WINDOW);
@@ -876,10 +1064,13 @@ pub fn spawn_task(
         let mut child = match result {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(TaskEvent::Error(format!("Failed to start claude: {e}")));
+                let _ = tx.blocking_send(TaskEvent::Error(format!("Failed to start claude: {e}")));
                 return;
             }
         };
+
+        // Record the PID so a `cancel_task` can kill the whole process tree.
+        set_task_pid(&task_id, child.id());
 
         // Stream stdout — parse stream-json events into readable status lines
         if let Some(stdout) = child.stdout.take() {
@@ -891,7 +1082,7 @@ pub fn spawn_task(
                         Ok(l) => {
                             if let Some(msg) = format_stream_event(&l) {
                                 if !msg.trim().is_empty() {
-                                    let _ = tx2.send(TaskEvent::Output { data: msg + "\n", stream: "stdout" });
+                                    let _ = tx2.blocking_send(TaskEvent::Output { data: msg + "\n", stream: "stdout" });
                                 }
                             }
                         }
@@ -908,7 +1099,7 @@ pub fn spawn_task(
                 for line in BufReader::new(stderr).lines() {
                     match line {
                         Ok(l) => {
-                            let _ = tx2.send(TaskEvent::Output { data: l + "\n", stream: "stderr" });
+                            let _ = tx2.blocking_send(TaskEvent::Output { data: l + "\n", stream: "stderr" });
                         }
                         Err(_) => break,
                     }
@@ -917,7 +1108,7 @@ pub fn spawn_task(
         }
 
         let exit_code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-        let _ = tx.send(TaskEvent::Done { exit_code });
+        let _ = tx.blocking_send(TaskEvent::Done { exit_code });
     });
 
     rx
@@ -939,24 +1130,26 @@ struct OllamaTaskFile {
 
 /// Ollama code-editing mode: read project files → ask Ollama for edits → write in-place.
 fn run_ollama_code_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     session_memory: Option<&str>,
     engine: &TaskEngine,
+    cancel: &AtomicBool,
 ) {
+    if cancel.load(Ordering::SeqCst) { return; }
     let endpoint = engine.endpoint.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
     if let Err(e) = validate_ollama_endpoint(&endpoint) {
-        let _ = tx.send(TaskEvent::Error(e));
+        let _ = tx.blocking_send(TaskEvent::Error(e));
         return;
     }
     let model_id = engine.model_id.clone().unwrap_or_else(|| "llama3.2".to_string());
 
-    let _ = tx.send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
 
     if !is_ollama_running(&endpoint) {
         if let Err(e) = setup_ollama(&model_id, &endpoint) {
-            let _ = tx.send(TaskEvent::Error(e));
+            let _ = tx.blocking_send(TaskEvent::Error(e));
             return;
         }
     }
@@ -964,7 +1157,7 @@ fn run_ollama_code_task(
     // Collect source files (capped at 40, skip large/binary files)
     let source_files = collect_code_files(project_path);
     if source_files.is_empty() {
-        let _ = tx.send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
+        let _ = tx.blocking_send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
         return;
     }
 
@@ -1009,14 +1202,14 @@ Rules:\n\
         file_listing,
     );
 
-    let task_prompt = compose_code_task_prompt(prompt, session_memory);
+    let task_prompt = compose_code_task_prompt(prompt, session_memory, project_path);
     let user_message = if file_contents.is_empty() {
         format!("Task: {}", task_prompt)
     } else {
         format!("Current file contents:\n\n{}\nTask: {}", file_contents, task_prompt)
     };
 
-    let _ = tx.send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
 
     let payload = serde_json::json!({
         "model": model_id,
@@ -1031,7 +1224,7 @@ Rules:\n\
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(TaskEvent::Error(format!("Could not build HTTP client: {e}")));
+            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not build HTTP client: {e}")));
             return;
         }
     };
@@ -1043,20 +1236,20 @@ Rules:\n\
     {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(TaskEvent::Error(format!("Ollama request failed: {e}")));
+            let _ = tx.blocking_send(TaskEvent::Error(format!("Ollama request failed: {e}")));
             return;
         }
     };
 
     if !response.status().is_success() {
-        let _ = tx.send(TaskEvent::Error(format!("Ollama returned {}", response.status())));
+        let _ = tx.blocking_send(TaskEvent::Error(format!("Ollama returned {}", response.status())));
         return;
     }
 
     let body = match response.json::<serde_json::Value>() {
         Ok(v) => v,
         Err(e) => {
-            let _ = tx.send(TaskEvent::Error(format!("Could not parse Ollama response: {e}")));
+            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not parse Ollama response: {e}")));
             return;
         }
     };
@@ -1064,7 +1257,7 @@ Rules:\n\
     let response_text = match body["response"].as_str() {
         Some(t) => t.to_string(),
         None => {
-            let _ = tx.send(TaskEvent::Error("Ollama did not return response text".to_string()));
+            let _ = tx.blocking_send(TaskEvent::Error("Ollama did not return response text".to_string()));
             return;
         }
     };
@@ -1075,19 +1268,19 @@ Rules:\n\
         Ok(r) => r,
         Err(e) => {
             eprintln!("[ollama-code] JSON parse failed: {e}");
-            let _ = tx.send(TaskEvent::Error(format!("Ollama returned unreadable output. Try rephrasing your request.")));
+            let _ = tx.blocking_send(TaskEvent::Error(format!("Ollama returned unreadable output. Try rephrasing your request.")));
             return;
         }
     };
 
     if let Some(summary) = result.summary.as_deref() {
-        let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+        let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
     }
 
     if let Some(response) = result.response.as_deref() {
         let trimmed = response.trim();
         if !trimmed.is_empty() {
-            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
         }
     }
 
@@ -1097,7 +1290,7 @@ Rules:\n\
         for question in &questions {
             let trimmed = question.trim();
             if !trimmed.is_empty() {
-                let _ = tx.send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
+                let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
             }
         }
         return;
@@ -1111,18 +1304,18 @@ Rules:\n\
         let sanitized = sanitize_code_path(&file.path, project_path);
         let full_path = std::path::Path::new(project_path).join(&sanitized);
         if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-            let _ = tx.send(TaskEvent::Error(reason));
+            let _ = tx.blocking_send(TaskEvent::Error(reason));
             return;
         }
         if let Some(parent) = full_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(e) = std::fs::write(&full_path, &file.content) {
-            let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
+            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
             return;
         }
         // Emit the same format the Claude Code parser expects so the app tracks changed files
-        let _ = tx.send(TaskEvent::Output {
+        let _ = tx.blocking_send(TaskEvent::Output {
             data: format!("[Edit] {}\n", sanitized.to_string_lossy().replace('\\', "/")),
             stream: "stdout",
         });
@@ -1212,34 +1405,34 @@ fn sanitize_code_path(path: &str, project_path: &str) -> std::path::PathBuf {
 }
 
 fn run_ollama_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     engine: &TaskEngine,
 ) {
     let endpoint = engine.endpoint.clone().unwrap_or_else(|| "http://localhost:11434".to_string());
     if let Err(e) = validate_ollama_endpoint(&endpoint) {
-        let _ = tx.send(TaskEvent::Error(e));
+        let _ = tx.blocking_send(TaskEvent::Error(e));
         return;
     }
     let model_id = engine.model_id.clone().unwrap_or_else(|| "llama3.2".to_string());
-    let _ = tx.send(TaskEvent::Output { data: "Setting up workspace\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Setting up workspace\n".to_string(), stream: "stdout" });
 
     if !is_ollama_running(&endpoint) {
         if let Err(error) = setup_ollama(&model_id, &endpoint) {
-            let _ = tx.send(TaskEvent::Error(error));
+            let _ = tx.blocking_send(TaskEvent::Error(error));
             return;
         }
     }
 
-    let _ = tx.send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
     let output_root = std::path::Path::new(project_path).join("outpost-output");
     let _ = std::fs::create_dir_all(&output_root);
 
     match request_ollama_files(project_path, prompt, &model_id, &endpoint) {
         Ok(result) => {
             if let Some(summary) = result.summary.as_deref() {
-                let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+                let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
             }
 
             let files = result.files.unwrap_or_default();
@@ -1248,7 +1441,7 @@ fn run_ollama_task(
             let questions = result.questions.unwrap_or_default();
             if !questions.is_empty() && files.is_empty() {
                 for question in &questions {
-                    let _ = tx.send(TaskEvent::Output { data: format!("{}\n", question.trim()), stream: "stdout" });
+                    let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", question.trim()), stream: "stdout" });
                 }
                 return;
             }
@@ -1261,17 +1454,17 @@ fn run_ollama_task(
                 let sanitized = sanitize_output_path(&file.path);
                 let full_path = output_root.join(&sanitized);
                 if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-                    let _ = tx.send(TaskEvent::Error(reason));
+                    let _ = tx.blocking_send(TaskEvent::Error(reason));
                     return;
                 }
                 if let Some(parent) = full_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if let Err(error) = std::fs::write(&full_path, &file.content) {
-                    let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {}", sanitized.display(), error)));
+                    let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {}", sanitized.display(), error)));
                     return;
                 }
-                let _ = tx.send(TaskEvent::Output {
+                let _ = tx.blocking_send(TaskEvent::Output {
                     data: format!("Created {}\n", sanitized.to_string_lossy()),
                     stream: "stdout",
                 });
@@ -1279,7 +1472,7 @@ fn run_ollama_task(
         }
         Err(error) => {
             eprintln!("[ollama] task error: {error}");
-            let _ = tx.send(TaskEvent::Error(error));
+            let _ = tx.blocking_send(TaskEvent::Error(error));
         }
     }
 }
@@ -1446,14 +1639,14 @@ fn gemini_generate(api_key: &str, model: &str, prompt: &str, json_mode: bool) ->
 }
 
 fn run_gemini_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     engine: &TaskEngine,
     api_key: &str,
 ) {
     let model = engine.model_id.clone().unwrap_or_else(|| "gemini-2.0-flash".to_string());
-    let _ = tx.send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
     let output_root = std::path::Path::new(project_path).join("outpost-output");
     let _ = std::fs::create_dir_all(&output_root);
 
@@ -1480,13 +1673,13 @@ Rules:\n\
             match serde_json::from_str::<OllamaTaskResponse>(&normalized) {
                 Ok(result) => {
                     if let Some(summary) = result.summary.as_deref() {
-                        let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
                     }
                     let questions = result.questions.unwrap_or_default();
                     let files = result.files.unwrap_or_default();
                     if !questions.is_empty() && files.is_empty() {
                         for q in &questions {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
                         }
                         return;
                     }
@@ -1494,43 +1687,45 @@ Rules:\n\
                         let sanitized = sanitize_output_path(&file.path);
                         let full_path = output_root.join(&sanitized);
                         if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(reason));
+                            let _ = tx.blocking_send(TaskEvent::Error(reason));
                             return;
                         }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
+                            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
                             return;
                         }
-                        let _ = tx.send(TaskEvent::Output { data: format!("Created {}\n", sanitized.to_string_lossy()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("Created {}\n", sanitized.to_string_lossy()), stream: "stdout" });
                     }
                 }
                 Err(_) => {
                     // Non-JSON or plain text response — just show it
-                    let _ = tx.send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
+                    let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
                 }
             }
         }
         Err(e) => {
-            let _ = tx.send(TaskEvent::Error(e));
+            let _ = tx.blocking_send(TaskEvent::Error(e));
         }
     }
 }
 
 fn run_gemini_code_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     session_memory: Option<&str>,
     engine: &TaskEngine,
     api_key: &str,
+    cancel: &AtomicBool,
 ) {
+    if cancel.load(Ordering::SeqCst) { return; }
     let model = engine.model_id.clone().unwrap_or_else(|| "gemini-2.0-flash".to_string());
-    let _ = tx.send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
 
     let source_files = collect_code_files(project_path);
     if source_files.is_empty() {
-        let _ = tx.send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
+        let _ = tx.blocking_send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
         return;
     }
 
@@ -1566,7 +1761,7 @@ Rules:\n\
         file_listing,
     );
 
-    let task_prompt = compose_code_task_prompt(prompt, session_memory);
+    let task_prompt = compose_code_task_prompt(prompt, session_memory, project_path);
     let user_message = if file_contents.is_empty() {
         format!("Task: {}", task_prompt)
     } else {
@@ -1575,7 +1770,7 @@ Rules:\n\
 
     let full_prompt = format!("{}\n\n{}", system_prompt, user_message);
 
-    let _ = tx.send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
 
     match gemini_generate(api_key, &model, &full_prompt, true) {
         Ok(text) => {
@@ -1584,19 +1779,19 @@ Rules:\n\
             match serde_json::from_str::<OllamaTaskResponse>(&normalized) {
                 Ok(result) => {
                     if let Some(summary) = result.summary.as_deref() {
-                        let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
                     }
                     if let Some(response) = result.response.as_deref() {
                         let trimmed = response.trim();
                         if !trimmed.is_empty() {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
                         }
                     }
                     let questions = result.questions.unwrap_or_default();
                     let files = result.files.unwrap_or_default();
                     if !questions.is_empty() && files.is_empty() {
                         for q in &questions {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
                         }
                         return;
                     }
@@ -1604,27 +1799,27 @@ Rules:\n\
                         let sanitized = sanitize_code_path(&file.path, project_path);
                         let full_path = std::path::Path::new(project_path).join(&sanitized);
                         if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(reason));
+                            let _ = tx.blocking_send(TaskEvent::Error(reason));
                             return;
                         }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
+                            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
                             return;
                         }
-                        let _ = tx.send(TaskEvent::Output {
+                        let _ = tx.blocking_send(TaskEvent::Output {
                             data: format!("[Edit] {}\n", sanitized.to_string_lossy().replace('\\', "/")),
                             stream: "stdout",
                         });
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
+                    let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
                 }
             }
         }
         Err(e) => {
-            let _ = tx.send(TaskEvent::Error(e));
+            let _ = tx.blocking_send(TaskEvent::Error(e));
         }
     }
 }
@@ -1679,7 +1874,7 @@ fn openai_compat_generate(
 }
 
 fn run_openai_compat_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     engine: &TaskEngine,
@@ -1688,7 +1883,7 @@ fn run_openai_compat_task(
     default_model: &str,
 ) {
     let model = engine.model_id.clone().unwrap_or_else(|| default_model.to_string());
-    let _ = tx.send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Working on your request\n".to_string(), stream: "stdout" });
     let output_root = std::path::Path::new(project_path).join("outpost-output");
     let _ = std::fs::create_dir_all(&output_root);
 
@@ -1713,13 +1908,13 @@ Rules:\n\
             match serde_json::from_str::<OllamaTaskResponse>(&normalized) {
                 Ok(result) => {
                     if let Some(summary) = result.summary.as_deref() {
-                        let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
                     }
                     let questions = result.questions.unwrap_or_default();
                     let files = result.files.unwrap_or_default();
                     if !questions.is_empty() && files.is_empty() {
                         for q in &questions {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
                         }
                         return;
                     }
@@ -1727,28 +1922,28 @@ Rules:\n\
                         let sanitized = sanitize_output_path(&file.path);
                         let full_path = output_root.join(&sanitized);
                         if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(reason));
+                            let _ = tx.blocking_send(TaskEvent::Error(reason));
                             return;
                         }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
+                            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
                             return;
                         }
-                        let _ = tx.send(TaskEvent::Output { data: format!("Created {}\n", sanitized.to_string_lossy()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("Created {}\n", sanitized.to_string_lossy()), stream: "stdout" });
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
+                    let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
                 }
             }
         }
-        Err(e) => { let _ = tx.send(TaskEvent::Error(e)); }
+        Err(e) => { let _ = tx.blocking_send(TaskEvent::Error(e)); }
     }
 }
 
 fn run_openai_compat_code_task(
-    tx: &mpsc::UnboundedSender<TaskEvent>,
+    tx: &mpsc::Sender<TaskEvent>,
     project_path: &str,
     prompt: &str,
     session_memory: Option<&str>,
@@ -1756,13 +1951,15 @@ fn run_openai_compat_code_task(
     api_key: &str,
     base_url: &str,
     default_model: &str,
+    cancel: &AtomicBool,
 ) {
+    if cancel.load(Ordering::SeqCst) { return; }
     let model = engine.model_id.clone().unwrap_or_else(|| default_model.to_string());
-    let _ = tx.send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Reading project files\n".to_string(), stream: "stdout" });
 
     let source_files = collect_code_files(project_path);
     if source_files.is_empty() {
-        let _ = tx.send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
+        let _ = tx.blocking_send(TaskEvent::Output { data: "No source files found in project\n".to_string(), stream: "stdout" });
         return;
     }
 
@@ -1798,14 +1995,14 @@ Rules:\n\
         file_listing,
     );
 
-    let task_prompt = compose_code_task_prompt(prompt, session_memory);
+    let task_prompt = compose_code_task_prompt(prompt, session_memory, project_path);
     let user_message = if file_contents.is_empty() {
         format!("Task: {}", task_prompt)
     } else {
         format!("Current file contents:\n\n{}\nTask: {}", file_contents, task_prompt)
     };
 
-    let _ = tx.send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
+    let _ = tx.blocking_send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
 
     match openai_compat_generate(api_key, base_url, &model, &system_prompt, &user_message, true) {
         Ok(text) => {
@@ -1814,19 +2011,19 @@ Rules:\n\
             match serde_json::from_str::<OllamaTaskResponse>(&normalized) {
                 Ok(result) => {
                     if let Some(summary) = result.summary.as_deref() {
-                        let _ = tx.send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
+                        let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", summary.trim()), stream: "stdout" });
                     }
                     if let Some(response) = result.response.as_deref() {
                         let trimmed = response.trim();
                         if !trimmed.is_empty() {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", trimmed), stream: "stdout" });
                         }
                     }
                     let questions = result.questions.unwrap_or_default();
                     let files = result.files.unwrap_or_default();
                     if !questions.is_empty() && files.is_empty() {
                         for q in &questions {
-                            let _ = tx.send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
+                            let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", q.trim()), stream: "stdout" });
                         }
                         return;
                     }
@@ -1834,26 +2031,26 @@ Rules:\n\
                         let sanitized = sanitize_code_path(&file.path, project_path);
                         let full_path = std::path::Path::new(project_path).join(&sanitized);
                         if let Err(reason) = validate_generated_file(&sanitized, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(reason));
+                            let _ = tx.blocking_send(TaskEvent::Error(reason));
                             return;
                         }
                         if let Some(parent) = full_path.parent() { let _ = std::fs::create_dir_all(parent); }
                         if let Err(e) = std::fs::write(&full_path, &file.content) {
-                            let _ = tx.send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
+                            let _ = tx.blocking_send(TaskEvent::Error(format!("Could not write {}: {e}", sanitized.display())));
                             return;
                         }
-                        let _ = tx.send(TaskEvent::Output {
+                        let _ = tx.blocking_send(TaskEvent::Output {
                             data: format!("[Edit] {}\n", sanitized.to_string_lossy().replace('\\', "/")),
                             stream: "stdout",
                         });
                     }
                 }
                 Err(_) => {
-                    let _ = tx.send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
+                    let _ = tx.blocking_send(TaskEvent::Output { data: format!("{}\n", text.trim()), stream: "stdout" });
                 }
             }
         }
-        Err(e) => { let _ = tx.send(TaskEvent::Error(e)); }
+        Err(e) => { let _ = tx.blocking_send(TaskEvent::Error(e)); }
     }
 }
 
@@ -1987,6 +2184,104 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+// ── Git diff collection (post-task) ──────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiff {
+    pub path: String,
+    pub status: String, // "modified" | "added" | "deleted"
+    pub additions: i32,
+    pub deletions: i32,
+    pub patch: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChanges {
+    pub files: Vec<FileDiff>,
+    pub is_git_repo: bool,
+}
+
+/// Run a git command for internal read-only use. Not routed through the relay
+/// capability or validation system — only called from collect_git_changes.
+fn run_raw_git(args: &[&str], cwd: &str) -> Result<String, String> {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output().map_err(|e| format!("git {}: {e}", args[0]))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn get_file_patch_from_head(project_path: &str, file_path: &str) -> String {
+    let full = std::path::Path::new(project_path).join(file_path);
+    if !full.starts_with(project_path) { return String::new(); }
+    let output = run_raw_git(&["diff", "HEAD", "--", file_path], project_path)
+        .unwrap_or_default();
+    const MAX_PATCH: usize = 4096;
+    if output.len() > MAX_PATCH {
+        let truncated: String = output.chars().take(MAX_PATCH).collect();
+        format!("{}\n[… diff truncated]", truncated.trim_end())
+    } else {
+        output
+    }
+}
+
+/// Collect git changes in the project after a task completes.
+/// Returns `is_git_repo: false` for non-git directories. For git repos with no
+/// staged/unstaged changes, returns an empty `files` list.
+pub fn collect_git_changes(project_path: &str) -> GitChanges {
+    if run_raw_git(&["rev-parse", "--git-dir"], project_path).is_err() {
+        return GitChanges { files: vec![], is_git_repo: false };
+    }
+    // New repo with no commits yet — nothing to diff against
+    if run_raw_git(&["rev-parse", "HEAD"], project_path).is_err() {
+        return GitChanges { files: vec![], is_git_repo: true };
+    }
+
+    let numstat = run_raw_git(&["diff", "HEAD", "--numstat"], project_path).unwrap_or_default();
+    let status_out = run_raw_git(&["status", "--porcelain"], project_path).unwrap_or_default();
+
+    let mut files: Vec<FileDiff> = Vec::new();
+
+    for line in numstat.lines().take(20) {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() < 3 { continue; }
+        if parts[0] == "-" || parts[1] == "-" { continue; } // binary
+        let additions: i32 = parts[0].parse().unwrap_or(0);
+        let deletions: i32 = parts[1].parse().unwrap_or(0);
+        let path = parts[2].trim().to_string();
+        let status = if additions == 0 && deletions > 0 { "deleted" }
+                     else if deletions == 0              { "added" }
+                     else                                { "modified" };
+        let patch = get_file_patch_from_head(project_path, &path);
+        files.push(FileDiff { path, status: status.to_string(), additions, deletions, patch });
+    }
+
+    // Include untracked new files not already captured above
+    for line in status_out.lines() {
+        if !line.starts_with("?? ") { continue; }
+        let path = line[3..].trim().trim_end_matches('/').to_string();
+        if path.ends_with('/') { continue; }
+        if files.iter().any(|f| f.path == path) { continue; }
+        if files.len() >= 20 { break; }
+        let full_path = std::path::Path::new(project_path).join(&path);
+        if !full_path.is_file() { continue; }
+        let content = std::fs::read_to_string(&full_path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let additions = lines.len() as i32;
+        let patch: String = lines.iter().take(100).map(|l| format!("+{l}\n")).collect();
+        files.push(FileDiff { path, status: "added".to_string(), additions, deletions: 0, patch });
+    }
+
+    GitChanges { files, is_git_repo: true }
 }
 
 /// Convert `C:\path\to\dir` → `/mnt/c/path/to/dir` for WSL

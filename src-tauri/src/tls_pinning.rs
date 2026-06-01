@@ -124,11 +124,21 @@ impl ServerCertVerifier for PinningVerifier {
             PinCheckOutcome::Matched => Ok(ServerCertVerified::assertion()),
 
             PinCheckOutcome::Tofu(hash) => {
+                // Must persist the pin before allowing the connection. Allowing TOFU
+                // without persisting would give an attacker unlimited TOFU windows by
+                // preventing write (e.g. full disk, symlink attack on the pin file).
                 if let Err(e) = crate::pin_manager::save_tofu_pin(&hash) {
-                    // Log but don't hard-fail on storage error during TOFU —
-                    // the connection itself is fine; the next connection will re-TOFU.
-                    eprintln!("[pin-audit] WARNING: failed to persist TOFU pin: {e}");
+                    eprintln!(
+                        "[pin-audit] ERROR: could not persist TOFU pin — rejecting connection \
+                         to prevent unlimited MITM windows: {e}"
+                    );
+                    return Err(TlsError::General(
+                        "certificate pinning: failed to persist TOFU pin; \
+                         resolve storage issue and reconnect"
+                            .into(),
+                    ));
                 }
+                eprintln!("[pin-audit] TOFU: relay SPKI pinned for future connections");
                 Ok(ServerCertVerified::assertion())
             }
 

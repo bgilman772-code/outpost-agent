@@ -5,11 +5,11 @@ fn main() {
     // in the compiled binary is equivalent to shipping a long-lived admin credential
     // that anyone can extract by reverse-engineering the binary.
     //
-    // The agent uses the QR/code pairing flow instead:
-    //   1. User opens the phone app → taps "Add PC" → sees a one-time code.
-    //   2. User enters the code in the agent desktop app.
-    //   3. Agent calls POST /agent/pair/:code/claim — no embedded secret required.
-    //   4. Codes expire in 10 minutes and are single-use.
+    // The agent uses a QR/code pairing flow instead:
+    //   1. Agent asks the relay for a short-lived desktop pairing link.
+    //   2. User scans that QR code or enters its code in the phone app.
+    //   3. Relay returns an agent token only after an authenticated phone claims it.
+    //   4. Codes expire quickly and are single-use.
     //
     // RELAY_URL is not a secret (it is a public endpoint address) so it is still
     // baked in as a default to avoid requiring manual entry on every install.

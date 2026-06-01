@@ -44,6 +44,8 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
     static GIT_PUSH:       &[Capability] = &[FilesystemRead, GitRead, GitWrite, NetworkAccess];
     static RUN_TASK:       &[Capability] = &[FilesystemRead, FilesystemWrite, ShellExecute, AIExecution, ArtifactUpload];
     static SETUP_OLLAMA:   &[Capability] = &[FilesystemWrite, NetworkAccess, ShellExecute];
+    // Cancelling a task only stops work the user already started — no new access.
+    static CANCEL_TASK:    &[Capability] = &[];
 
     match msg_type {
         "registered"         => Some(NONE),
@@ -55,6 +57,7 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
         "clone_repo"         => Some(CLONE_REPO),
         "git_push"           => Some(GIT_PUSH),
         "run_task"           => Some(RUN_TASK),
+        "cancel_task"        => Some(CANCEL_TASK),
         "setup_ollama"       => Some(SETUP_OLLAMA),
         _                    => None,
     }

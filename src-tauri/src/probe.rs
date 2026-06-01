@@ -28,6 +28,13 @@ pub struct ProjectInfo {
     pub git_remote: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct DetectedCredential {
+    pub key: String,
+    pub label: String,
+    pub source: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProbeResult {
     pub os: String,
@@ -44,6 +51,67 @@ pub struct ProbeResult {
     pub node_installed: bool,
     pub git_installed: bool,
     pub projects: Vec<ProjectInfo>,
+    pub detected_credentials: Vec<DetectedCredential>,
+}
+
+// Detect credentials/keys already present on this machine (env vars + well-known
+// credential files) so the phone can use them without the user re-entering anything.
+// Only PRESENCE is reported — never the secret value.
+fn detect_credentials() -> Vec<DetectedCredential> {
+    let mut found: Vec<DetectedCredential> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let add = |key: &str, label: &str, source: &str, found: &mut Vec<DetectedCredential>, seen: &mut std::collections::HashSet<String>| {
+        if seen.contains(key) {
+            return;
+        }
+        seen.insert(key.to_string());
+        found.push(DetectedCredential { key: key.to_string(), label: label.to_string(), source: source.to_string() });
+    };
+
+    let env_keys: &[(&str, &str)] = &[
+        ("ANTHROPIC_API_KEY", "Anthropic API key"),
+        ("OPENAI_API_KEY", "OpenAI API key"),
+        ("GEMINI_API_KEY", "Google AI API key"),
+        ("GROQ_API_KEY", "Groq API key"),
+        ("MISTRAL_API_KEY", "Mistral API key"),
+        ("GITHUB_TOKEN", "GitHub token"),
+        ("GH_TOKEN", "GitHub token"),
+        ("VERCEL_TOKEN", "Vercel token"),
+        ("NETLIFY_AUTH_TOKEN", "Netlify token"),
+        ("CLOUDFLARE_API_TOKEN", "Cloudflare token"),
+        ("AWS_SECRET_ACCESS_KEY", "AWS credentials"),
+        ("SUPABASE_SERVICE_ROLE_KEY", "Supabase key"),
+        ("STRIPE_SECRET_KEY", "Stripe key"),
+        ("DROPBOX_TOKEN", "Dropbox token"),
+    ];
+    for (k, label) in env_keys {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                add(k, label, "env", &mut found, &mut seen);
+            }
+        }
+    }
+
+    if let Some(home) = dirs_home() {
+        let file_checks: &[(&str, &str, &str)] = &[
+            ("AWS_SECRET_ACCESS_KEY", "AWS credentials", ".aws/credentials"),
+            ("GITHUB_TOKEN", "GitHub CLI auth", ".config/gh/hosts.yml"),
+            ("ANTHROPIC_API_KEY", "Claude credentials", ".claude/.credentials.json"),
+        ];
+        for (key, label, rel) in file_checks {
+            if home.join(rel).exists() {
+                add(key, label, "file", &mut found, &mut seen);
+            }
+        }
+    }
+
+    found
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
 }
 
 pub fn run_probe(hostname: &str) -> ProbeResult {
@@ -69,6 +137,7 @@ pub fn run_probe(hostname: &str) -> ProbeResult {
         node_installed: command_exists_win("node", "--version"),
         git_installed: command_exists_win("git", "--version"),
         projects,
+        detected_credentials: detect_credentials(),
     }
 }
 

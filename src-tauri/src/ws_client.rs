@@ -22,6 +22,11 @@ use crate::capabilities;
 
 static CLAUDE_PATH: OnceLock<String> = OnceLock::new();
 
+/// Upper bound on inbound relay messages dispatched concurrently per connection.
+/// Generous enough that normal operation never blocks; low enough that a flood
+/// can't spawn unbounded handler tasks.
+const MAX_CONCURRENT_DISPATCH: usize = 32;
+
 pub fn init_claude_path() {
     if CLAUDE_PATH.get().is_some() { return; }
     #[allow(unused_mut)]
@@ -80,6 +85,13 @@ async fn run_loop(
     token: String,
     stop: &mut watch::Receiver<bool>,
 ) {
+    // Reconnect backoff: start small so a brief network blip recovers fast,
+    // grow exponentially (with jitter) up to a cap so a relay outage doesn't
+    // hammer the server or burn the laptop battery. Reset on a successful connect.
+    const RECONNECT_BASE_SECS: u64 = 2;
+    const RECONNECT_MAX_SECS: u64 = 60;
+    let mut backoff_secs = RECONNECT_BASE_SECS;
+
     loop {
         if *stop.borrow() { break; }
 
@@ -113,33 +125,54 @@ async fn run_loop(
                 continue;
             }
         };
-        req.headers_mut().insert(
-            "authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
+        let auth_value = match format!("Bearer {token}").parse() {
+            Ok(v) => v,
+            Err(e) => {
+                wslog!("invalid auth token header ({e}); refusing to connect");
+                let _ = app.emit("connection_state", ConnState::Disconnected);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = stop.changed() => { break; }
+                }
+                continue;
+            }
+        };
+        req.headers_mut().insert("authorization", auth_value);
 
         let tls_connector = Connector::Rustls(crate::tls_pinning::build_tls_config());
         match connect_async_tls_with_config(req, None, false, Some(tls_connector)).await {
             Ok((ws_stream, _)) => {
                 wslog!("connected to {ws_url}");
                 let _ = app.emit("connection_state", ConnState::Connected);
+                backoff_secs = RECONNECT_BASE_SECS; // healthy connection — reset backoff
 
                 let (write, mut read) = ws_stream.split();
                 let write = Arc::new(tokio::sync::Mutex::new(write));
                 let relay_url_arc = Arc::new(relay_url.clone());
                 let token_arc = Arc::new(token.clone());
+                // Cap how many inbound messages we dispatch concurrently so a flood
+                // of messages can't spawn unbounded handler tasks. Handlers are
+                // short-lived (they verify the signature then spawn the actual work),
+                // so this rarely engages; when it does the read loop briefly pauses,
+                // applying natural backpressure on the socket.
+                let dispatch_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DISPATCH));
 
                 loop {
                     tokio::select! {
                         msg = read.next() => {
                             match msg {
                                 Some(Ok(Message::Text(txt))) => {
+                                    let permit = match dispatch_sem.clone().acquire_owned().await {
+                                        Ok(p) => p,
+                                        Err(_) => break, // semaphore closed — shouldn't happen
+                                    };
                                     let write2 = write.clone();
                                     let txt_str = txt.to_string();
                                     let relay_url2 = relay_url_arc.clone();
                                     let token2 = token_arc.clone();
                                     let app2 = app.clone();
                                     tokio::spawn(async move {
+                                        let _permit = permit; // released when the handler returns
                                         handle_text_message(&txt_str, write2, relay_url2, token2, app2).await;
                                     });
                                 }
@@ -173,10 +206,20 @@ async fn run_loop(
         }
 
         let _ = app.emit("connection_state", ConnState::Disconnected);
+        // Add up to ±25% jitter so many agents reconnecting after a relay restart
+        // don't stampede in lockstep.
+        let jitter_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_millis())
+            .unwrap_or(0) as u64)
+            % (backoff_secs * 500 + 1);
+        let delay = std::time::Duration::from_secs(backoff_secs)
+            + std::time::Duration::from_millis(jitter_ms);
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = stop.changed() => { break; }
         }
+        backoff_secs = (backoff_secs * 2).min(RECONNECT_MAX_SECS);
     }
     let _ = app.emit("connection_state", ConnState::Disconnected);
 }
@@ -412,8 +455,12 @@ async fn handle_registered(
                 .checked_sub(std::time::Duration::from_secs(30 * 24 * 3600))
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             for proj_path in &sync_paths {
+                // Startup backfill scans outpost-output/ only. Snapshotting the
+                // current tree means the new-deliverable fallback is a no-op here
+                // (nothing is being created during sync).
+                let snap = crate::artifact_uploader::snapshot_project_files(proj_path);
                 let _ = crate::artifact_uploader::upload_new_artifacts(
-                    proj_path, "", &relay3, &tok3, cutoff, true,
+                    proj_path, "", &relay3, &tok3, cutoff, true, &snap,
                 ).await;
             }
         });
@@ -650,6 +697,22 @@ async fn dispatch_action(
             let use_wsl = msg["useWsl"].as_bool().unwrap_or(false);
             let wsl_distro = msg["wslDistro"].as_str().map(|s| s.to_string());
             let is_code_task = msg["isCodeTask"].as_bool().unwrap_or(false);
+            // Vault secrets injected by relay — set as env vars so tasks can call
+            // tools that read VERCEL_TOKEN, GITHUB_TOKEN, etc. from the environment.
+            let vault_secrets: std::collections::HashMap<String, String> = msg["vaultSecrets"]
+                .as_object()
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| {
+                            // Guard: only valid env-var identifiers pass through.
+                            let safe = k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                && !k.is_empty()
+                                && k.len() <= 128;
+                            if safe { v.as_str().map(|s| (k.clone(), s.to_string())) } else { None }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             if task_id.is_empty() || project_path.is_empty() || prompt.is_empty() { return; }
 
@@ -662,8 +725,11 @@ async fn dispatch_action(
 
             tokio::spawn(async move {
                 let task_started_at = std::time::SystemTime::now();
+                // Capture pre-existing files so we can later distinguish newly
+                // created deliverables from edits to files that already existed.
+                let pre_existing = crate::artifact_uploader::snapshot_project_files(&proj);
                 let engine = task_runner::TaskEngine { provider_id, model_id, endpoint, api_key, is_code_task };
-                let mut rx = task_runner::spawn_task(tid.clone(), proj.clone(), prompt, session_memory, engine, use_wsl, wsl_distro, claude_path);
+                let mut rx = task_runner::spawn_task(tid.clone(), proj.clone(), prompt, session_memory, engine, use_wsl, wsl_distro, claude_path, vault_secrets);
                 while let Some(event) = rx.recv().await {
                     let is_terminal = matches!(
                         event,
@@ -697,10 +763,30 @@ async fn dispatch_action(
                         let proj3 = proj.clone();
                         let relay3 = relay_url2.clone();
                         let tok3 = token2.clone();
+                        let pre_existing3 = pre_existing.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                            // Collect git diff and forward to the phone
+                            let changes = tokio::task::spawn_blocking({
+                                let p = proj3.clone();
+                                move || crate::task_runner::collect_git_changes(&p)
+                            }).await.unwrap_or_else(|_| crate::task_runner::GitChanges {
+                                files: vec![],
+                                is_git_repo: false,
+                            });
+                            if changes.is_git_repo && !changes.files.is_empty() {
+                                let diff_msg = serde_json::json!({
+                                    "type": "files_changed",
+                                    "taskId": tid3,
+                                    "files": changes.files,
+                                    "isGitRepo": changes.is_git_repo,
+                                });
+                                let _ = write3.lock().await
+                                    .send(Message::Text(diff_msg.to_string().into()))
+                                    .await;
+                            }
                             let artifacts = crate::artifact_uploader::upload_new_artifacts(
-                                &proj3, &tid3, &relay3, &tok3, task_started_at, is_code_task,
+                                &proj3, &tid3, &relay3, &tok3, task_started_at, is_code_task, &pre_existing3,
                             ).await;
                             if !artifacts.is_empty() {
                                 let filenames: Vec<String> = artifacts.iter()
@@ -721,6 +807,14 @@ async fn dispatch_action(
                     }
                 }
             });
+        }
+
+        Some("cancel_task") => {
+            let task_id = msg["taskId"].as_str().unwrap_or("").to_string();
+            if !task_id.is_empty() {
+                let cancelled = crate::task_runner::cancel_task(&task_id);
+                wslog!("cancel_task {} -> {}", task_id, cancelled);
+            }
         }
 
         _ => {}

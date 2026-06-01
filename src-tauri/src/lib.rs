@@ -60,6 +60,40 @@ struct PhoneLinkResult {
     link_code: String,
 }
 
+#[derive(serde::Serialize)]
+struct DesktopPairStartResult {
+    relay_url: String,
+    desktop_token: String,
+    link_token: String,
+    link_code: String,
+    expires_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DesktopPairStartResponse {
+    #[serde(rename = "relayUrl")]
+    relay_url: String,
+    #[serde(rename = "desktopToken")]
+    desktop_token: String,
+    #[serde(rename = "linkToken")]
+    link_token: String,
+    #[serde(rename = "linkCode")]
+    link_code: String,
+    #[serde(rename = "expiresAt")]
+    expires_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct DesktopPairStatusResponse {
+    status: String,
+    #[serde(rename = "relayUrl")]
+    relay_url: Option<String>,
+    #[serde(rename = "agentToken")]
+    agent_token: Option<String>,
+    #[serde(rename = "agentMachineId")]
+    agent_machine_id: Option<String>,
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 // RELAY_URL is a public endpoint address, not a secret.
@@ -258,6 +292,116 @@ async fn get_phone_link(app: AppHandle) -> Result<PhoneLinkResult, String> {
         .ok_or_else(|| "Failed to generate phone link".to_string())
 }
 
+/// Start a desktop-shows-QR pairing flow. The returned desktop token is a
+/// short-lived polling secret and is never encoded into the QR code.
+#[tauri::command]
+async fn start_desktop_pairing(app: AppHandle) -> Result<DesktopPairStartResult, String> {
+    let cfg = config::load(&app);
+    let relay_url = if !cfg.relay_url_override.is_empty() {
+        cfg.relay_url_override.trim_end_matches('/').to_string()
+    } else {
+        RELAY_URL.trim_end_matches('/').to_string()
+    };
+    validate_relay_url(&relay_url)?;
+
+    let hostname = config::get_hostname();
+    let os = std::env::consts::OS.to_string();
+    let url = format!("{relay_url}/agent/desktop-link/start");
+    let resp = tls_pinning::get_pinned_http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "hostname": hostname, "os": os }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Pairing link failed ({status}): {body}"));
+    }
+
+    let body: DesktopPairStartResponse = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(DesktopPairStartResult {
+        relay_url: if body.relay_url.is_empty() { relay_url } else { body.relay_url },
+        desktop_token: body.desktop_token,
+        link_token: body.link_token,
+        link_code: body.link_code,
+        expires_at: body.expires_at,
+    })
+}
+
+#[tauri::command]
+async fn check_desktop_pairing(
+    app: AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    desktop_token: String,
+) -> Result<Option<PairResult>, String> {
+    if !desktop_token.chars().all(|c| c.is_ascii_hexdigit()) || desktop_token.len() != 64 {
+        return Err("Invalid desktop pairing token".into());
+    }
+
+    let cfg = config::load(&app);
+    let relay_url = if !cfg.relay_url_override.is_empty() {
+        cfg.relay_url_override.trim_end_matches('/').to_string()
+    } else {
+        RELAY_URL.trim_end_matches('/').to_string()
+    };
+    validate_relay_url(&relay_url)?;
+
+    let url = format!("{relay_url}/agent/desktop-link/status");
+    let resp = tls_pinning::get_pinned_http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "desktopToken": desktop_token }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if resp.status().as_u16() == 404 {
+        return Err("Pairing code expired. Refresh and try again.".into());
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Pairing status failed ({status}): {body}"));
+    }
+
+    let body: DesktopPairStatusResponse = resp.json().await.map_err(|e| e.to_string())?;
+    if body.status != "claimed" {
+        return Ok(None);
+    }
+
+    let token = body.agent_token.ok_or("No agent token in pairing response")?;
+    let agent_machine_id = body.agent_machine_id.ok_or("No agentMachineId in pairing response")?;
+    let resolved_relay_url = body
+        .relay_url
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(relay_url);
+    let hostname = config::get_hostname();
+
+    credentials::store_token(&token).map_err(|e| format!("Failed to store token: {e}"))?;
+    let existing = config::load(&app);
+    let new_cfg = config::AgentConfig {
+        relay_url: resolved_relay_url.clone(),
+        token: String::new(),
+        agent_machine_id: agent_machine_id.clone(),
+        hostname: hostname.clone(),
+        relay_url_override: existing.relay_url_override,
+        token_issued_at: Some(now_unix()),
+    };
+    config::save(&app, &new_cfg).map_err(|e| format!("Failed to save config: {e}"))?;
+    start_ws_connection(&app, &state, resolved_relay_url.clone(), token.clone());
+
+    let link = fetch_phone_link(&resolved_relay_url, &token).await;
+    Ok(Some(PairResult {
+        paired: true,
+        relay_url: resolved_relay_url,
+        hostname,
+        agent_machine_id,
+        link_token: link.as_ref().map(|l| l.link_token.clone()).unwrap_or_default(),
+        link_code: link.as_ref().map(|l| l.link_code.clone()).unwrap_or_default(),
+    }))
+}
+
 /// Internal helper — fetches a fresh phone link from the relay.
 async fn fetch_phone_link(relay_url: &str, agent_token: &str) -> Option<PhoneLinkResult> {
     let url = format!("{}/agent/refresh-phone-link", relay_url.trim_end_matches('/'));
@@ -444,6 +588,8 @@ pub fn run() {
             pair_with_code,
             pair,
             get_phone_link,
+            start_desktop_pairing,
+            check_desktop_pairing,
             unpair,
             check_update,
             approve_action_id,

@@ -1,9 +1,21 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     "pptx", "docx", "pdf", "csv", "xlsx", "txt", "md",
     "py", "js", "ts", "zip", "png", "jpg", "jpeg", "svg", "json",
+    "html", "htm", "css",
+];
+
+// Document/media file types a user would expect to download as a finished
+// deliverable. Used for the fallback scan that catches exports the model saved
+// outside `outpost-output/`. Deliberately excludes source-code/churn types
+// (py, js, ts, json, css, md, txt) so normal in-place edits and new-project
+// scaffolds don't flood the user's Files with noise.
+const DELIVERABLE_EXTENSIONS: &[&str] = &[
+    "pptx", "docx", "pdf", "csv", "xlsx", "zip",
+    "png", "jpg", "jpeg", "svg", "html", "htm",
 ];
 
 const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
@@ -30,7 +42,68 @@ pub struct UploadedArtifact {
     pub artifact_id: String,
 }
 
+/// Snapshot the set of files that already exist in the project at task start.
+///
+/// Captured before the model runs so we can later tell a *newly created*
+/// deliverable apart from an edited pre-existing file. Paths are canonicalized
+/// so they compare reliably against post-task discovery. The `outpost-output/`
+/// subtree is skipped — files there are always treated as deliverables.
+pub fn snapshot_project_files(project_path: &str) -> HashSet<PathBuf> {
+    let root = PathBuf::from(project_path);
+    let output_dir = root.join("outpost-output");
+    let mut out = HashSet::new();
+    snapshot_recursive(&root, &output_dir, MAX_SCAN_DEPTH, 0, &mut out);
+    out
+}
+
+fn snapshot_recursive(
+    dir: &Path,
+    output_dir: &Path,
+    max_depth: usize,
+    depth: usize,
+    out: &mut HashSet<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+            continue;
+        }
+        if path == *output_dir {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            if depth < max_depth {
+                snapshot_recursive(&path, output_dir, max_depth, depth + 1, out);
+            }
+        } else if meta.file_type().is_file() {
+            if let Ok(canon) = std::fs::canonicalize(&path) {
+                out.insert(canon);
+            }
+        }
+    }
+}
+
 /// Scan `project_path` for files modified at or after `since`, then upload each to the relay.
+///
+/// For code/working sessions (`output_only`), the canonical deliverable location
+/// is `outpost-output/`, which is deep-scanned for any supported file. As a
+/// safety net we *also* surface newly-created document/media deliverables saved
+/// elsewhere in the project — headless CLIs often drop a requested report,
+/// mockup, or deck in the project root or a new subfolder despite instructions.
+/// `pre_existing` is the file snapshot taken at task start; only files absent
+/// from it count as new, so ordinary edits and scaffolding stay out of Files.
 pub async fn upload_new_artifacts(
     project_path: &str,
     task_id: &str,
@@ -38,15 +111,14 @@ pub async fn upload_new_artifacts(
     token: &str,
     since: SystemTime,
     output_only: bool,
+    pre_existing: &HashSet<PathBuf>,
 ) -> Vec<UploadedArtifact> {
-    let scan_root = if output_only {
-        Path::new(project_path).join("outpost-output")
-    } else {
-        PathBuf::from(project_path)
-    };
+    let project_root = PathBuf::from(project_path);
+    let output_dir = project_root.join("outpost-output");
 
-    // Canonicalize workspace root once; all collected paths are validated against it.
-    let canonical_root = match std::fs::canonicalize(&scan_root) {
+    // The project root is the containment boundary; every collected path is
+    // validated to live inside it before upload.
+    let canonical_root = match std::fs::canonicalize(&project_root) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[artifacts] failed to canonicalize workspace root: {}", e);
@@ -54,7 +126,27 @@ pub async fn upload_new_artifacts(
         }
     };
 
-    let files = collect_modified_files(&scan_root, since, MAX_SCAN_DEPTH);
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    if output_only {
+        // 1) Primary: everything new under outpost-output/.
+        files.extend(collect_modified_files(&output_dir, since, MAX_SCAN_DEPTH));
+        // 2) Fallback: new deliverables the model saved elsewhere in the project.
+        collect_new_deliverables(
+            &project_root, &output_dir, since, pre_existing, MAX_SCAN_DEPTH, 0, &mut files,
+        );
+    } else {
+        // Non-code task: scan the whole project for any supported file (legacy).
+        files.extend(collect_modified_files(&project_root, since, MAX_SCAN_DEPTH));
+    }
+
+    // De-duplicate by canonical path (a file may be reached by both scans).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    files.retain(|p| {
+        let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
+
     if files.is_empty() {
         return Vec::new();
     }
@@ -74,6 +166,76 @@ pub async fn upload_new_artifacts(
     }
 
     results
+}
+
+/// Walk the project (skipping `outpost-output/`, hidden dirs, and SKIP_DIRS) for
+/// files that are (a) modified at/after `since`, (b) a document/media deliverable
+/// type, and (c) absent from the pre-task snapshot — i.e. freshly created.
+fn collect_new_deliverables(
+    dir: &Path,
+    output_dir: &Path,
+    since: SystemTime,
+    pre_existing: &HashSet<PathBuf>,
+    max_depth: usize,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+            continue;
+        }
+        // outpost-output is handled by the primary deep scan.
+        if path == *output_dir {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            if depth < max_depth {
+                collect_new_deliverables(&path, output_dir, since, pre_existing, max_depth, depth + 1, out);
+            }
+            continue;
+        }
+        if !meta.file_type().is_file() {
+            continue;
+        }
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if !DELIVERABLE_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        if BLOCKED_FILENAMES.contains(&name) {
+            continue;
+        }
+        let size = meta.len();
+        if size == 0 || size > MAX_FILE_SIZE {
+            continue;
+        }
+        match meta.modified() {
+            Ok(modified) if modified >= since => {}
+            _ => continue,
+        }
+        // Only surface files that did not exist before the task ran.
+        let canon = match std::fs::canonicalize(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if pre_existing.contains(&canon) {
+            continue;
+        }
+        out.push(path);
+    }
 }
 
 fn collect_modified_files(base: &Path, since: SystemTime, max_depth: usize) -> Vec<PathBuf> {
@@ -205,18 +367,11 @@ async fn upload_one(
         return None;
     }
 
-    // Send only the project directory name (not the full local path) to avoid
-    // leaking the user's filesystem layout and username to the relay server.
-    let project_name = std::path::Path::new(project_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(project_path);
-
     let base = relay_url.trim_end_matches('/');
     let upload_url = format!("{base}/artifacts/upload");
     let send_result = client
         .post(&upload_url)
-        .query(&[("taskId", task_id), ("projectPath", project_name)])
+        .query(&[("taskId", task_id), ("projectPath", project_path)])
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/octet-stream")
         .header("X-Filename", urlencoded_filename(&filename))
@@ -630,5 +785,86 @@ mod tests {
     #[test]
     fn test_aws_key_no_match_clean_content() {
         assert!(!contains_aws_key("no credentials here"));
+    }
+
+    // ── Snapshot + new-deliverable fallback ───────────────────────────────────
+
+    #[test]
+    fn test_snapshot_captures_existing_excludes_output_dir() {
+        let ws = temp_dir_path("ws_snapshot");
+        fs::create_dir_all(ws.join("outpost-output")).unwrap();
+        fs::create_dir_all(ws.join("node_modules")).unwrap();
+        fs::write(ws.join("index.html"), b"<html></html>").unwrap();
+        fs::write(ws.join("outpost-output").join("old.pdf"), b"%PDF-1.4").unwrap();
+        fs::write(ws.join("node_modules").join("dep.js"), b"x").unwrap();
+
+        let snap = snapshot_project_files(ws.to_str().unwrap());
+        let index = fs::canonicalize(ws.join("index.html")).unwrap();
+        let out_pdf = fs::canonicalize(ws.join("outpost-output").join("old.pdf")).unwrap();
+
+        assert!(snap.contains(&index), "existing project file should be captured");
+        assert!(!snap.contains(&out_pdf), "outpost-output files must be excluded from snapshot");
+        // node_modules is skipped entirely
+        assert!(snap.iter().all(|p| !p.to_string_lossy().contains("node_modules")));
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn test_new_deliverable_in_project_root_is_collected() {
+        let ws = temp_dir_path("ws_new_deliverable");
+        fs::create_dir_all(ws.join("outpost-output")).unwrap();
+        // A pre-existing source file that we will "edit" after the snapshot.
+        let existing_src = ws.join("app.js");
+        fs::write(&existing_src, b"console.log(1)").unwrap();
+
+        let snap = snapshot_project_files(ws.to_str().unwrap());
+        let since = SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Model edits the existing source (should NOT surface) ...
+        fs::write(&existing_src, b"console.log(2)").unwrap();
+        // ... and drops a brand-new mockup in the project root instead of outpost-output.
+        let mockup = ws.join("mockup.html");
+        fs::write(&mockup, b"<html>mock</html>").unwrap();
+        // A new source file should also be ignored (not a deliverable type).
+        fs::write(ws.join("helper.ts"), b"export const x = 1").unwrap();
+
+        let output_dir = ws.join("outpost-output");
+        let mut out = Vec::new();
+        collect_new_deliverables(&ws, &output_dir, since, &snap, MAX_SCAN_DEPTH, 0, &mut out);
+
+        let names: Vec<String> = out
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"mockup.html".to_string()), "new deliverable should be collected, got {names:?}");
+        assert!(!names.contains(&"app.js".to_string()), "edited pre-existing source must not be collected");
+        assert!(!names.contains(&"helper.ts".to_string()), "new non-deliverable source must not be collected");
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn test_pre_existing_deliverable_edit_not_recollected() {
+        let ws = temp_dir_path("ws_existing_deliverable");
+        fs::create_dir_all(ws.join("outpost-output")).unwrap();
+        let report = ws.join("report.pdf");
+        fs::write(&report, b"%PDF-1.4 old").unwrap();
+
+        let snap = snapshot_project_files(ws.to_str().unwrap());
+        let since = SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Overwrite the existing deliverable — it existed before the task, so it
+        // should not be treated as a freshly created export.
+        fs::write(&report, b"%PDF-1.4 new").unwrap();
+
+        let output_dir = ws.join("outpost-output");
+        let mut out = Vec::new();
+        collect_new_deliverables(&ws, &output_dir, since, &snap, MAX_SCAN_DEPTH, 0, &mut out);
+
+        assert!(out.is_empty(), "edited pre-existing deliverable must not be recollected");
+
+        fs::remove_dir_all(&ws).ok();
     }
 }
