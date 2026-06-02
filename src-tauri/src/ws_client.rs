@@ -810,6 +810,7 @@ async fn dispatch_action(
                                 let notify = serde_json::json!({
                                     "type": "artifacts_ready",
                                     "taskId": tid3,
+                                    "projectPath": proj3,
                                     "count": artifacts.len(),
                                     "filenames": filenames,
                                 });
