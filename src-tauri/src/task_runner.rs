@@ -1482,6 +1482,7 @@ fn run_ollama_task(
         }
         Err(error) => {
             eprintln!("[ollama] task error: {error}");
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("[ToolError] {}\n", error), stream: "stdout" });
             let _ = tx.blocking_send(TaskEvent::Error(error));
         }
     }
@@ -1947,7 +1948,10 @@ Rules:\n\
                 }
             }
         }
-        Err(e) => { let _ = tx.blocking_send(TaskEvent::Error(e)); }
+        Err(e) => {
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("[ToolError] {}\n", e), stream: "stdout" });
+            let _ = tx.blocking_send(TaskEvent::Error(e));
+        }
     }
 }
 
@@ -2059,7 +2063,10 @@ Rules:\n\
                 }
             }
         }
-        Err(e) => { let _ = tx.blocking_send(TaskEvent::Error(e)); }
+        Err(e) => {
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("[ToolError] {}\n", e), stream: "stdout" });
+            let _ = tx.blocking_send(TaskEvent::Error(e));
+        }
     }
 }
 
