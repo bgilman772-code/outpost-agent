@@ -951,11 +951,13 @@ pub fn spawn_task(
             return;
         }
 
-        if matches!(engine.provider_id.as_str(), "openai" | "groq" | "mistral") {
+        if matches!(engine.provider_id.as_str(), "openai" | "groq" | "mistral" | "grok" | "cohere") {
             let (base_url, default_model, display_name) = match engine.provider_id.as_str() {
-                "openai"  => ("https://api.openai.com/v1",           "gpt-4o",                    "OpenAI"),
-                "groq"    => ("https://api.groq.com/openai/v1",      "llama-3.3-70b-versatile",   "Groq"),
-                "mistral" => ("https://api.mistral.ai/v1",           "mistral-large-latest",      "Mistral"),
+                "openai"  => ("https://api.openai.com/v1",                     "gpt-4o",                    "OpenAI"),
+                "groq"    => ("https://api.groq.com/openai/v1",                "llama-3.3-70b-versatile",   "Groq"),
+                "mistral" => ("https://api.mistral.ai/v1",                     "mistral-large-latest",      "Mistral"),
+                "grok"    => ("https://api.x.ai/v1",                           "grok-2-1212",               "Grok"),
+                "cohere"  => ("https://api.cohere.com/compatibility/v1",       "command-r-plus-08-2024",    "Cohere"),
                 _         => unreachable!(),
             };
             match engine.api_key.as_deref() {
@@ -1603,7 +1605,7 @@ Rules:\n\
     })
 }
 
-fn gemini_generate(api_key: &str, model: &str, prompt: &str, json_mode: bool) -> Result<String, String> {
+fn gemini_generate(api_key: &str, model: &str, system: &str, user: &str, json_mode: bool) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -1620,7 +1622,8 @@ fn gemini_generate(api_key: &str, model: &str, prompt: &str, json_mode: bool) ->
     }
 
     let payload = serde_json::json!({
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "systemInstruction": { "parts": [{ "text": system }] },
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
         "generationConfig": generation_config,
     });
 
@@ -1672,9 +1675,7 @@ Rules:\n\
         project_path.replace('\\', "/"),
     );
 
-    let full_prompt = format!("{}\n\nUser request:\n{}", system_prompt, prompt);
-
-    match gemini_generate(api_key, &model, &full_prompt, true) {
+    match gemini_generate(api_key, &model, &system_prompt, prompt, true) {
         Ok(text) => {
             let clean = extract_json_object(&text);
             let normalized = normalize_ollama_json(clean);
@@ -1713,6 +1714,7 @@ Rules:\n\
             }
         }
         Err(e) => {
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("[ToolError] {}\n", e), stream: "stdout" });
             let _ = tx.blocking_send(TaskEvent::Error(e));
         }
     }
@@ -1776,11 +1778,9 @@ Rules:\n\
         format!("Current file contents:\n\n{}\nTask: {}", file_contents, task_prompt)
     };
 
-    let full_prompt = format!("{}\n\n{}", system_prompt, user_message);
-
     let _ = tx.blocking_send(TaskEvent::Output { data: "Generating code changes\n".to_string(), stream: "stdout" });
 
-    match gemini_generate(api_key, &model, &full_prompt, true) {
+    match gemini_generate(api_key, &model, &system_prompt, &user_message, true) {
         Ok(text) => {
             let clean = extract_json_object(&text);
             let normalized = normalize_ollama_json(clean);
@@ -1827,12 +1827,13 @@ Rules:\n\
             }
         }
         Err(e) => {
+            let _ = tx.blocking_send(TaskEvent::Output { data: format!("[ToolError] {}\n", e), stream: "stdout" });
             let _ = tx.blocking_send(TaskEvent::Error(e));
         }
     }
 }
 
-// ── OpenAI-compatible providers (OpenAI, Groq, Mistral) ──────────────────────
+// ── OpenAI-compatible providers (OpenAI, Groq, Mistral, Grok, Cohere) ────────
 
 fn openai_compat_generate(
     api_key: &str,
