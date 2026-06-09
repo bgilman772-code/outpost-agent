@@ -60,12 +60,20 @@ pub struct ProbeResult {
 fn detect_credentials() -> Vec<DetectedCredential> {
     let mut found: Vec<DetectedCredential> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let add = |key: &str, label: &str, source: &str, found: &mut Vec<DetectedCredential>, seen: &mut std::collections::HashSet<String>| {
+    let add = |key: &str,
+               label: &str,
+               source: &str,
+               found: &mut Vec<DetectedCredential>,
+               seen: &mut std::collections::HashSet<String>| {
         if seen.contains(key) {
             return;
         }
         seen.insert(key.to_string());
-        found.push(DetectedCredential { key: key.to_string(), label: label.to_string(), source: source.to_string() });
+        found.push(DetectedCredential {
+            key: key.to_string(),
+            label: label.to_string(),
+            source: source.to_string(),
+        });
     };
 
     let env_keys: &[(&str, &str)] = &[
@@ -94,9 +102,17 @@ fn detect_credentials() -> Vec<DetectedCredential> {
 
     if let Some(home) = dirs_home() {
         let file_checks: &[(&str, &str, &str)] = &[
-            ("AWS_SECRET_ACCESS_KEY", "AWS credentials", ".aws/credentials"),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS credentials",
+                ".aws/credentials",
+            ),
             ("GITHUB_TOKEN", "GitHub CLI auth", ".config/gh/hosts.yml"),
-            ("ANTHROPIC_API_KEY", "Claude credentials", ".claude/.credentials.json"),
+            (
+                "ANTHROPIC_API_KEY",
+                "Claude credentials",
+                ".claude/.credentials.json",
+            ),
         ];
         for (key, label, rel) in file_checks {
             if home.join(rel).exists() {
@@ -148,6 +164,75 @@ fn command_exists_win(cmd: &str, arg: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+// ── Agent runtime detection ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeProbe {
+    /// Matches the AgentRuntime ids used by the relay/app.
+    pub runtime: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    /// Authentication is runtime-specific and not yet detected — left unknown.
+    pub authenticated: Option<bool>,
+}
+
+/// Probe for installed agent-runtime CLIs by running each one's `--version`.
+/// Reports installation + version; a missing binary simply reports installed
+/// = false rather than failing the whole probe.
+pub fn probe_runtimes() -> Vec<RuntimeProbe> {
+    // (AgentRuntime id, binary, version arg)
+    const RUNTIMES: &[(&str, &str, &str)] = &[
+        ("claude_code", "claude", "--version"),
+        ("codex", "codex", "--version"),
+        ("goose", "goose", "--version"),
+        ("opencode", "opencode", "--version"),
+        ("cursor_cli", "cursor-agent", "--version"),
+    ];
+
+    RUNTIMES
+        .iter()
+        .map(|(id, bin, arg)| {
+            let version = runtime_version(bin, arg);
+            RuntimeProbe {
+                runtime: (*id).to_string(),
+                installed: version.is_some(),
+                version,
+                authenticated: None,
+            }
+        })
+        .collect()
+}
+
+/// Run `<bin> <arg>` and return the first line of stdout if it exits 0, else None.
+fn runtime_version(bin: &str, arg: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", bin, arg]);
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new(bin);
+        c.arg(arg);
+        c
+    };
+    cmd.no_window();
+
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let line = text.lines().next().unwrap_or("").trim().to_string();
+            Some(if line.is_empty() {
+                "installed".to_string()
+            } else {
+                line
+            })
+        }
+        _ => None,
+    }
 }
 
 fn probe_wsl() -> (bool, Vec<String>) {
@@ -363,8 +448,13 @@ fn probe_ollama_runtime(endpoint: &str) -> (bool, Vec<String>) {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build();
-    let Ok(client) = client else { return (false, vec![]); };
-    let Ok(resp) = client.get(format!("{}/api/tags", endpoint.trim_end_matches('/'))).send() else {
+    let Ok(client) = client else {
+        return (false, vec![]);
+    };
+    let Ok(resp) = client
+        .get(format!("{}/api/tags", endpoint.trim_end_matches('/')))
+        .send()
+    else {
         return (false, vec![]);
     };
     if !resp.status().is_success() {
@@ -384,7 +474,13 @@ fn probe_ollama_runtime(endpoint: &str) -> (bool, Vec<String>) {
 
 fn git_remote_for(path: &Path) -> Option<String> {
     Command::new("git")
-        .args(["-C", path.to_str().unwrap_or("."), "remote", "get-url", "origin"])
+        .args([
+            "-C",
+            path.to_str().unwrap_or("."),
+            "remote",
+            "get-url",
+            "origin",
+        ])
         .no_window()
         .output()
         .ok()
@@ -421,7 +517,8 @@ fn scan_projects() -> Vec<ProjectInfo> {
 
         // Root itself might be a git repo
         if is_git_repo(root_path) {
-            let name = root_path.file_name()
+            let name = root_path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.clone());
             projects.push(ProjectInfo {
@@ -437,7 +534,8 @@ fn scan_projects() -> Vec<ProjectInfo> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() && is_git_repo(&path) {
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
                     let path_str = path.to_string_lossy().to_string();

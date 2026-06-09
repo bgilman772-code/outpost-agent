@@ -1,9 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
+use std::sync::{Arc, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{oneshot, watch};
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::client::IntoClientRequest, Connector};
 use tokio_tungstenite::tungstenite::Message;
-use std::sync::{Arc, OnceLock};
+use tokio_tungstenite::{
+    connect_async_tls_with_config, tungstenite::client::IntoClientRequest, Connector,
+};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -16,9 +18,9 @@ macro_rules! wslog {
     };
 }
 
+use crate::capabilities;
 use crate::probe;
 use crate::task_runner;
-use crate::capabilities;
 
 static CLAUDE_PATH: OnceLock<String> = OnceLock::new();
 
@@ -28,7 +30,9 @@ static CLAUDE_PATH: OnceLock<String> = OnceLock::new();
 const MAX_CONCURRENT_DISPATCH: usize = 32;
 
 pub fn init_claude_path() {
-    if CLAUDE_PATH.get().is_some() { return; }
+    if CLAUDE_PATH.get().is_some() {
+        return;
+    }
     #[allow(unused_mut)]
     let mut cmd = std::process::Command::new("cmd");
     cmd.args(["/C", "where", "claude"]);
@@ -37,7 +41,11 @@ pub fn init_claude_path() {
     if let Ok(out) = cmd.output() {
         if out.status.success() {
             let cmd_path = String::from_utf8_lossy(&out.stdout)
-                .lines().next().unwrap_or("").trim().to_string();
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !cmd_path.is_empty() {
                 let resolved = crate::probe::resolve_claude_exe(&cmd_path);
                 let _ = CLAUDE_PATH.set(resolved);
@@ -55,7 +63,10 @@ pub fn init_claude_path() {
 }
 
 pub fn get_claude_path() -> String {
-    CLAUDE_PATH.get().cloned().unwrap_or_else(|| "claude".to_string())
+    CLAUDE_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -67,9 +78,7 @@ pub enum ConnState {
 }
 
 type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
 
@@ -93,7 +102,9 @@ async fn run_loop(
     let mut backoff_secs = RECONNECT_BASE_SECS;
 
     loop {
-        if *stop.borrow() { break; }
+        if *stop.borrow() {
+            break;
+        }
 
         if relay_url.starts_with("http://") {
             wslog!("refusing plaintext ws:// connection; configure an https:// relay URL");
@@ -202,7 +213,9 @@ async fn run_loop(
                     }
                 }
             }
-            Err(e) => { wslog!("connect failed: {e}"); }
+            Err(e) => {
+                wslog!("connect failed: {e}");
+            }
         }
 
         let _ = app.emit("connection_state", ConnState::Disconnected);
@@ -253,7 +266,7 @@ async fn handle_text_message(
         // integrity against third-party injection.
         Some("cmd") => {
             let payload_str = msg["cmd"].as_str().unwrap_or("");
-            let sig         = msg["sig"].as_str().unwrap_or("");
+            let sig = msg["sig"].as_str().unwrap_or("");
 
             if payload_str.is_empty() || sig.is_empty() {
                 capabilities::audit_log("cmd", &[], false, Some("missing_payload_or_sig"));
@@ -307,7 +320,10 @@ async fn dispatch_command(
         Some(c) => c,
         None => {
             capabilities::audit_log(msg_type, &[], false, Some("not_on_capability_allowlist"));
-            wslog!("SECURITY: rejected '{}': not on capability allowlist", msg_type);
+            wslog!(
+                "SECURITY: rejected '{}': not on capability allowlist",
+                msg_type
+            );
             return;
         }
     };
@@ -317,12 +333,19 @@ async fn dispatch_command(
     // User approval gate for dangerous operations
     if capabilities::requires_approval(msg_type) {
         let description = format_approval_description(&msg);
-        let action_id = msg.get("pushId").or(msg.get("taskId"))
-            .and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let action_id = msg
+            .get("pushId")
+            .or(msg.get("taskId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
         let approved = request_approval(&app, msg_type, &description, &action_id).await;
         if !approved {
             capabilities::audit_log(msg_type, caps, false, Some("denied_by_user_or_timeout"));
-            wslog!("action '{}' denied (user declined or 30s timeout)", msg_type);
+            wslog!(
+                "action '{}' denied (user declined or 30s timeout)",
+                msg_type
+            );
             send_denial_response(msg_type, &msg, &write).await;
             return;
         }
@@ -337,7 +360,9 @@ fn format_approval_description(msg: &serde_json::Value) -> String {
     match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "git_push" => {
             let path = msg["projectPath"].as_str().unwrap_or("unknown path");
-            let commit = msg["commitMessage"].as_str().unwrap_or("Outpost: code changes");
+            let commit = msg["commitMessage"]
+                .as_str()
+                .unwrap_or("Outpost: code changes");
             format!("Push to: {}\nCommit message: {}", path, commit)
         }
         other => format!("Action: {}", other),
@@ -360,7 +385,11 @@ async fn send_denial_response(
         }
         _ => return,
     };
-    let _ = write.lock().await.send(Message::Text(response.to_string().into())).await;
+    let _ = write
+        .lock()
+        .await
+        .send(Message::Text(response.to_string().into()))
+        .await;
 }
 
 /// Request user approval for a dangerous action. Emits a `permission_request`
@@ -381,33 +410,43 @@ async fn request_approval(
         guard.pending.insert(request_id.clone(), tx);
     }
 
-    let _ = app.emit("permission_request", serde_json::json!({
-        "requestId": request_id,
-        "actionType": action_type,
-        "description": description,
-    }));
+    let _ = app.emit(
+        "permission_request",
+        serde_json::json!({
+            "requestId": request_id,
+            "actionType": action_type,
+            "description": description,
+        }),
+    );
 
     match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
         Ok(Ok(approved)) => {
-            let _ = app.emit("permission_resolved", serde_json::json!({
-                "requestId": request_id,
-                "approved": approved,
-            }));
+            let _ = app.emit(
+                "permission_resolved",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "approved": approved,
+                }),
+            );
             approved
         }
         _ => {
             // Timeout or channel dropped — remove stale entry and deny
-            if let Ok(mut guard) = app.state::<std::sync::Mutex<crate::ApprovalState>>()
-                .lock()
-            {
+            if let Ok(mut guard) = app.state::<std::sync::Mutex<crate::ApprovalState>>().lock() {
                 guard.pending.remove(&request_id);
             }
-            let _ = app.emit("permission_resolved", serde_json::json!({
-                "requestId": request_id,
-                "approved": false,
-                "reason": "timeout",
-            }));
-            wslog!("approval for '{}' timed out after 30s — denied", action_type);
+            let _ = app.emit(
+                "permission_resolved",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "approved": false,
+                    "reason": "timeout",
+                }),
+            );
+            wslog!(
+                "approval for '{}' timed out after 30s — denied",
+                action_type
+            );
             false
         }
     }
@@ -424,7 +463,11 @@ async fn handle_registered(
     let write2 = write.clone();
     tokio::spawn(async move {
         let begin = serde_json::json!({ "type": "startup_begin" });
-        let _ = write2.lock().await.send(Message::Text(begin.to_string().into())).await;
+        let _ = write2
+            .lock()
+            .await
+            .send(Message::Text(begin.to_string().into()))
+            .await;
 
         let hostname = crate::config::get_hostname();
         let result = tokio::task::spawn_blocking(move || crate::probe::run_probe(&hostname))
@@ -444,7 +487,11 @@ async fn handle_registered(
             "type": "startup_complete",
             "projectCount": count,
         });
-        let _ = write2.lock().await.send(Message::Text(complete.to_string().into())).await;
+        let _ = write2
+            .lock()
+            .await
+            .send(Message::Text(complete.to_string().into()))
+            .await;
 
         let relay3 = relay_url.clone();
         let tok3 = token.clone();
@@ -461,7 +508,8 @@ async fn handle_registered(
                 let snap = crate::artifact_uploader::snapshot_project_files(proj_path);
                 let _ = crate::artifact_uploader::upload_new_artifacts(
                     proj_path, "", &relay3, &tok3, cutoff, true, &snap,
-                ).await;
+                )
+                .await;
             }
         });
     });
@@ -484,12 +532,19 @@ async fn dispatch_action(
                     crate::task_runner::ensure_project_setup(&path);
                 });
             } else if !path.is_empty() {
-                wslog!("setup_project: rejected path outside home directory: {}", path);
+                wslog!(
+                    "setup_project: rejected path outside home directory: {}",
+                    path
+                );
             }
         }
 
         Some("probe") => {
-            let probe_id = msg.get("probeId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let probe_id = msg
+                .get("probeId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let hostname = crate::config::get_hostname();
             let result = tokio::task::spawn_blocking(move || probe::run_probe(&hostname))
                 .await
@@ -504,7 +559,11 @@ async fn dispatch_action(
                 "probeId": probe_id,
                 "data": result,
             });
-            let _ = write.lock().await.send(Message::Text(response.to_string().into())).await;
+            let _ = write
+                .lock()
+                .await
+                .send(Message::Text(response.to_string().into()))
+                .await;
         }
 
         Some("create_project") => {
@@ -512,13 +571,17 @@ async fn dispatch_action(
             let name = msg["name"].as_str().unwrap_or("").to_string();
             let parent_dir = msg["parentDir"].as_str().map(|s| s.to_string());
 
-            if create_id.is_empty() || name.is_empty() { return; }
+            if create_id.is_empty() || name.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::create_project(&name, parent_dir.as_deref())
-                }).await.unwrap_or_else(|_| Err("Task panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("Task panicked".to_string()));
 
                 let response = match result {
                     Ok(path) => serde_json::json!({
@@ -532,20 +595,28 @@ async fn dispatch_action(
                         "error": e,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
         Some("list_project_files") => {
             let request_id = msg["requestId"].as_str().unwrap_or("").to_string();
             let project_path = msg["projectPath"].as_str().unwrap_or("").to_string();
-            if request_id.is_empty() || project_path.is_empty() { return; }
+            if request_id.is_empty() || project_path.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::list_project_files(&project_path)
-                }).await.unwrap_or_else(|_| Err("File scan panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("File scan panicked".to_string()));
 
                 let response = match result {
                     Ok(files) => serde_json::json!({
@@ -559,20 +630,28 @@ async fn dispatch_action(
                         "error": error,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
         Some("list_directories") => {
             let request_id = msg["requestId"].as_str().unwrap_or("").to_string();
             let path = msg["path"].as_str().map(|s| s.to_string());
-            if request_id.is_empty() { return; }
+            if request_id.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::list_directories(path.as_deref())
-                }).await.unwrap_or_else(|_| Err("Directory browse panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("Directory browse panicked".to_string()));
 
                 let response = match result {
                     Ok(result) => serde_json::json!({
@@ -586,23 +665,63 @@ async fn dispatch_action(
                         "error": error,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
+            });
+        }
+
+        Some("probe_runtimes") => {
+            let request_id = msg["requestId"].as_str().unwrap_or("").to_string();
+            if request_id.is_empty() {
+                return;
+            }
+            let write2 = write.clone();
+            tokio::spawn(async move {
+                let runtimes = tokio::task::spawn_blocking(probe::probe_runtimes)
+                    .await
+                    .unwrap_or_default();
+                let response = serde_json::json!({
+                    "type": "runtimes_result",
+                    "requestId": request_id,
+                    "runtimes": runtimes,
+                });
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
         Some("setup_ollama") => {
             let request_id = msg["requestId"].as_str().unwrap_or("").to_string();
             let model_id = msg["modelId"].as_str().unwrap_or("").to_string();
-            let endpoint = msg["endpoint"].as_str().unwrap_or("http://localhost:11434").to_string();
-            if request_id.is_empty() || model_id.is_empty() { return; }
+            let endpoint = msg["endpoint"]
+                .as_str()
+                .unwrap_or("http://localhost:11434")
+                .to_string();
+            if request_id.is_empty() || model_id.is_empty() {
+                return;
+            }
             if let Err(e) = crate::task_runner::validate_ollama_endpoint(&endpoint) {
                 wslog!("setup_ollama: rejected endpoint: {}", e);
                 let write2 = write.clone();
-                let _ = write2.lock().await.send(Message::Text(serde_json::json!({
-                    "type": "ollama_setup_error",
-                    "requestId": request_id,
-                    "error": e,
-                }).to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "ollama_setup_error",
+                            "requestId": request_id,
+                            "error": e,
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
                 return;
             }
 
@@ -610,7 +729,9 @@ async fn dispatch_action(
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::setup_ollama(&model_id, &endpoint)
-                }).await.unwrap_or_else(|_| Err("Ollama setup panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("Ollama setup panicked".to_string()));
 
                 let response = match result {
                     Ok(data) => serde_json::json!({
@@ -624,7 +745,11 @@ async fn dispatch_action(
                         "error": error,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
@@ -632,13 +757,17 @@ async fn dispatch_action(
             let clone_id = msg["cloneId"].as_str().unwrap_or("").to_string();
             let repo_url = msg["repoUrl"].as_str().unwrap_or("").to_string();
             let name = msg["name"].as_str().unwrap_or("").to_string();
-            if clone_id.is_empty() || repo_url.is_empty() || name.is_empty() { return; }
+            if clone_id.is_empty() || repo_url.is_empty() || name.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::clone_repo(&repo_url, &name)
-                }).await.unwrap_or_else(|_| Err("Clone panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("Clone panicked".to_string()));
 
                 let response = match result {
                     Ok(path) => serde_json::json!({
@@ -652,16 +781,25 @@ async fn dispatch_action(
                         "error": e,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
         Some("git_push") => {
             let push_id = msg["pushId"].as_str().unwrap_or("").to_string();
             let project_path = msg["projectPath"].as_str().unwrap_or("").to_string();
-            let commit_message = msg["commitMessage"].as_str().unwrap_or("Outpost: code changes").to_string();
+            let commit_message = msg["commitMessage"]
+                .as_str()
+                .unwrap_or("Outpost: code changes")
+                .to_string();
             let github_token = msg["githubToken"].as_str().map(|s| s.to_string());
-            if push_id.is_empty() || project_path.is_empty() { return; }
+            if push_id.is_empty() || project_path.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             tokio::spawn(async move {
@@ -670,7 +808,9 @@ async fn dispatch_action(
                 let tok_clone = github_token.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     crate::task_runner::git_push(&proj, &msg_clone, tok_clone.as_deref())
-                }).await.unwrap_or_else(|_| Err("Git push panicked".to_string()));
+                })
+                .await
+                .unwrap_or_else(|_| Err("Git push panicked".to_string()));
 
                 let response = match result {
                     Ok(output) => {
@@ -696,7 +836,11 @@ async fn dispatch_action(
                         "error": e,
                     }),
                 };
-                let _ = write2.lock().await.send(Message::Text(response.to_string().into())).await;
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(response.to_string().into()))
+                    .await;
             });
         }
 
@@ -705,7 +849,10 @@ async fn dispatch_action(
             let project_path = msg["projectPath"].as_str().unwrap_or("").to_string();
             let prompt = msg["prompt"].as_str().unwrap_or("").to_string();
             let session_memory = msg["sessionMemory"].as_str().map(|s| s.to_string());
-            let provider_id = msg["providerId"].as_str().unwrap_or("anthropic").to_string();
+            let provider_id = msg["providerId"]
+                .as_str()
+                .unwrap_or("anthropic")
+                .to_string();
             let model_id = msg["modelId"].as_str().map(|s| s.to_string());
             let endpoint = msg["endpoint"].as_str().map(|s| s.to_string());
             let api_key = msg["apiKey"].as_str().map(|s| s.to_string());
@@ -723,13 +870,19 @@ async fn dispatch_action(
                             let safe = k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                                 && !k.is_empty()
                                 && k.len() <= 128;
-                            if safe { v.as_str().map(|s| (k.clone(), s.to_string())) } else { None }
+                            if safe {
+                                v.as_str().map(|s| (k.clone(), s.to_string()))
+                            } else {
+                                None
+                            }
                         })
                         .collect()
                 })
                 .unwrap_or_default();
 
-            if task_id.is_empty() || project_path.is_empty() || prompt.is_empty() { return; }
+            if task_id.is_empty() || project_path.is_empty() || prompt.is_empty() {
+                return;
+            }
 
             let write2 = write.clone();
             let tid = task_id.clone();
@@ -743,8 +896,24 @@ async fn dispatch_action(
                 // Capture pre-existing files so we can later distinguish newly
                 // created deliverables from edits to files that already existed.
                 let pre_existing = crate::artifact_uploader::snapshot_project_files(&proj);
-                let engine = task_runner::TaskEngine { provider_id, model_id, endpoint, api_key, is_code_task };
-                let mut rx = task_runner::spawn_task(tid.clone(), proj.clone(), prompt, session_memory, engine, use_wsl, wsl_distro, claude_path, vault_secrets);
+                let engine = task_runner::TaskEngine {
+                    provider_id,
+                    model_id,
+                    endpoint,
+                    api_key,
+                    is_code_task,
+                };
+                let mut rx = task_runner::spawn_task(
+                    tid.clone(),
+                    proj.clone(),
+                    prompt,
+                    session_memory,
+                    engine,
+                    use_wsl,
+                    wsl_distro,
+                    claude_path,
+                    vault_secrets,
+                );
                 while let Some(event) = rx.recv().await {
                     let is_terminal = matches!(
                         event,
@@ -769,7 +938,13 @@ async fn dispatch_action(
                             "error": e,
                         }),
                     };
-                    if write2.lock().await.send(Message::Text(msg.to_string().into())).await.is_err() {
+                    if write2
+                        .lock()
+                        .await
+                        .send(Message::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     if is_terminal {
@@ -785,9 +960,13 @@ async fn dispatch_action(
                             let changes = tokio::task::spawn_blocking({
                                 let p = proj3.clone();
                                 move || crate::task_runner::collect_git_changes(&p)
-                            }).await.unwrap_or_else(|_| crate::task_runner::GitChanges {
-                                files: vec![],
-                                is_git_repo: false,
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                crate::task_runner::GitChanges {
+                                    files: vec![],
+                                    is_git_repo: false,
+                                }
                             });
                             if changes.is_git_repo && !changes.files.is_empty() {
                                 let diff_msg = serde_json::json!({
@@ -796,17 +975,25 @@ async fn dispatch_action(
                                     "files": changes.files,
                                     "isGitRepo": changes.is_git_repo,
                                 });
-                                let _ = write3.lock().await
+                                let _ = write3
+                                    .lock()
+                                    .await
                                     .send(Message::Text(diff_msg.to_string().into()))
                                     .await;
                             }
                             let artifacts = crate::artifact_uploader::upload_new_artifacts(
-                                &proj3, &tid3, &relay3, &tok3, task_started_at, is_code_task, &pre_existing3,
-                            ).await;
+                                &proj3,
+                                &tid3,
+                                &relay3,
+                                &tok3,
+                                task_started_at,
+                                is_code_task,
+                                &pre_existing3,
+                            )
+                            .await;
                             if !artifacts.is_empty() {
-                                let filenames: Vec<String> = artifacts.iter()
-                                    .map(|a| a.filename.clone())
-                                    .collect();
+                                let filenames: Vec<String> =
+                                    artifacts.iter().map(|a| a.filename.clone()).collect();
                                 let notify = serde_json::json!({
                                     "type": "artifacts_ready",
                                     "taskId": tid3,
@@ -814,7 +1001,9 @@ async fn dispatch_action(
                                     "count": artifacts.len(),
                                     "filenames": filenames,
                                 });
-                                let _ = write3.lock().await
+                                let _ = write3
+                                    .lock()
+                                    .await
                                     .send(Message::Text(notify.to_string().into()))
                                     .await;
                             }
@@ -843,18 +1032,25 @@ async fn dispatch_action(
 /// branch or create a new one. Returns the HTML URL on success, None on any
 /// error (network, auth, already up-to-date branch, etc.) — the push itself
 /// is not affected.
-async fn create_or_find_github_pr(project_path: &str, commit_message: &str, token: &str) -> Option<String> {
+async fn create_or_find_github_pr(
+    project_path: &str,
+    commit_message: &str,
+    token: &str,
+) -> Option<String> {
     // Read the remote URL and current branch (blocking git calls).
     let (remote_url, current_branch) = tokio::task::spawn_blocking({
         let p = project_path.to_string();
         move || {
             let remote = crate::task_runner::run_git_readonly(&["remote", "get-url", "origin"], &p)
                 .unwrap_or_default();
-            let branch = crate::task_runner::run_git_readonly(&["symbolic-ref", "--short", "HEAD"], &p)
-                .unwrap_or_default();
+            let branch =
+                crate::task_runner::run_git_readonly(&["symbolic-ref", "--short", "HEAD"], &p)
+                    .unwrap_or_default();
             (remote.trim().to_string(), branch.trim().to_string())
         }
-    }).await.ok()?;
+    })
+    .await
+    .ok()?;
 
     // Only works for GitHub HTTPS remotes.
     if !remote_url.starts_with("https://") || !remote_url.contains("github.com") {
@@ -885,7 +1081,10 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
         return None;
     }
     let repo_info: serde_json::Value = repo_resp.json().await.ok()?;
-    let default_branch = repo_info["default_branch"].as_str().unwrap_or("main").to_string();
+    let default_branch = repo_info["default_branch"]
+        .as_str()
+        .unwrap_or("main")
+        .to_string();
 
     // Don't open a PR when pushing straight to the default branch.
     if current_branch == default_branch {
@@ -900,7 +1099,9 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
             ("head", &format!("{owner}:{current_branch}")),
             ("per_page", "1"),
         ])
-        .send().await.ok()?;
+        .send()
+        .await
+        .ok()?;
 
     if list_resp.status().is_success() {
         let items: serde_json::Value = list_resp.json().await.ok()?;
@@ -910,8 +1111,13 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
     }
 
     // Derive a PR title from the commit message (first line, max 72 chars).
-    let title: String = commit_message.lines().next().unwrap_or("Outpost changes")
-        .chars().take(72).collect();
+    let title: String = commit_message
+        .lines()
+        .next()
+        .unwrap_or("Outpost changes")
+        .chars()
+        .take(72)
+        .collect();
 
     let body = serde_json::json!({
         "title": title,
@@ -922,7 +1128,9 @@ async fn create_or_find_github_pr(project_path: &str, commit_message: &str, toke
 
     let create_resp = send(client.post(format!("{api_base}/pulls")))
         .json(&body)
-        .send().await.ok()?;
+        .send()
+        .await
+        .ok()?;
 
     if create_resp.status().is_success() {
         let pr: serde_json::Value = create_resp.json().await.ok()?;
@@ -947,13 +1155,16 @@ fn github_api_client() -> &'static reqwest::Client {
 
 /// Parse `https://github.com/owner/repo.git` → `("owner", "repo")`.
 fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-    let path = url.trim_end_matches(".git")
+    let path = url
+        .trim_end_matches(".git")
         .trim_end_matches('/')
         .split("github.com/")
         .nth(1)?;
     let mut parts = path.splitn(2, '/');
     let owner = parts.next()?.to_string();
     let repo = parts.next()?.to_string();
-    if owner.is_empty() || repo.is_empty() { return None; }
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
     Some((owner, repo))
 }
