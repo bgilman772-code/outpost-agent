@@ -4,6 +4,7 @@ mod config;
 mod credentials;
 mod pin_manager;
 mod probe;
+mod run_executor;
 mod task_runner;
 mod tls_pinning;
 mod ws_client;
@@ -179,8 +180,14 @@ async fn pair_with_code(
     }
 
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let token = body["token"].as_str().ok_or("No token in response")?.to_string();
-    let agent_machine_id = body["agentMachineId"].as_str().ok_or("No agentMachineId")?.to_string();
+    let token = body["token"]
+        .as_str()
+        .ok_or("No token in response")?
+        .to_string();
+    let agent_machine_id = body["agentMachineId"]
+        .as_str()
+        .ok_or("No agentMachineId")?
+        .to_string();
 
     credentials::store_token(&token).map_err(|e| format!("Failed to store token: {e}"))?;
     if let Some(rt) = body["refreshToken"].as_str() {
@@ -206,8 +213,14 @@ async fn pair_with_code(
         relay_url,
         hostname,
         agent_machine_id,
-        link_token: link.as_ref().map(|l| l.link_token.clone()).unwrap_or_default(),
-        link_code: link.as_ref().map(|l| l.link_code.clone()).unwrap_or_default(),
+        link_token: link
+            .as_ref()
+            .map(|l| l.link_token.clone())
+            .unwrap_or_default(),
+        link_code: link
+            .as_ref()
+            .map(|l| l.link_code.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -241,7 +254,10 @@ async fn pair(
     }
 
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let token = body["token"].as_str().ok_or("No token in response")?.to_string();
+    let token = body["token"]
+        .as_str()
+        .ok_or("No token in response")?
+        .to_string();
     let agent_machine_id = body["agentMachineId"]
         .as_str()
         .ok_or("No agentMachineId in response")?
@@ -270,8 +286,14 @@ async fn pair(
         relay_url,
         hostname,
         agent_machine_id,
-        link_token: link.as_ref().map(|l| l.link_token.clone()).unwrap_or_default(),
-        link_code: link.as_ref().map(|l| l.link_code.clone()).unwrap_or_default(),
+        link_token: link
+            .as_ref()
+            .map(|l| l.link_token.clone())
+            .unwrap_or_default(),
+        link_code: link
+            .as_ref()
+            .map(|l| l.link_code.clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -322,7 +344,11 @@ async fn start_desktop_pairing(app: AppHandle) -> Result<DesktopPairStartResult,
 
     let body: DesktopPairStartResponse = resp.json().await.map_err(|e| e.to_string())?;
     Ok(DesktopPairStartResult {
-        relay_url: if body.relay_url.is_empty() { relay_url } else { body.relay_url },
+        relay_url: if body.relay_url.is_empty() {
+            relay_url
+        } else {
+            body.relay_url
+        },
         desktop_token: body.desktop_token,
         link_token: body.link_token,
         link_code: body.link_code,
@@ -370,8 +396,12 @@ async fn check_desktop_pairing(
         return Ok(None);
     }
 
-    let token = body.agent_token.ok_or("No agent token in pairing response")?;
-    let agent_machine_id = body.agent_machine_id.ok_or("No agentMachineId in pairing response")?;
+    let token = body
+        .agent_token
+        .ok_or("No agent token in pairing response")?;
+    let agent_machine_id = body
+        .agent_machine_id
+        .ok_or("No agentMachineId in pairing response")?;
     let resolved_relay_url = body
         .relay_url
         .filter(|url| !url.trim().is_empty())
@@ -397,14 +427,23 @@ async fn check_desktop_pairing(
         relay_url: resolved_relay_url,
         hostname,
         agent_machine_id,
-        link_token: link.as_ref().map(|l| l.link_token.clone()).unwrap_or_default(),
-        link_code: link.as_ref().map(|l| l.link_code.clone()).unwrap_or_default(),
+        link_token: link
+            .as_ref()
+            .map(|l| l.link_token.clone())
+            .unwrap_or_default(),
+        link_code: link
+            .as_ref()
+            .map(|l| l.link_code.clone())
+            .unwrap_or_default(),
     }))
 }
 
 /// Internal helper — fetches a fresh phone link from the relay.
 async fn fetch_phone_link(relay_url: &str, agent_token: &str) -> Option<PhoneLinkResult> {
-    let url = format!("{}/agent/refresh-phone-link", relay_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/agent/refresh-phone-link",
+        relay_url.trim_end_matches('/')
+    );
     let resp = tls_pinning::get_pinned_http_client()
         .post(&url)
         .header("Authorization", format!("Bearer {agent_token}"))
@@ -533,7 +572,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Mutex::new(AppState { ws_stop_tx: None }))
-        .manage(Mutex::new(ApprovalState { pending: HashMap::new() }))
+        .manage(Mutex::new(ApprovalState {
+            pending: HashMap::new(),
+        }))
         .setup(|app| {
             ws_client::init_claude_path();
 
@@ -544,7 +585,8 @@ pub fn run() {
                 } else {
                     return Err(format!(
                         "[credentials] {e} — cannot start without secure credential storage"
-                    ).into());
+                    )
+                    .into());
                 }
             }
 
@@ -566,7 +608,9 @@ pub fn run() {
                         start_ws_connection(app.handle(), &state, cfg.relay_url, token);
                     }
                     Ok(None) => {
-                        eprintln!("[credentials] paired config but no token in keyring; re-pair required");
+                        eprintln!(
+                            "[credentials] paired config but no token in keyring; re-pair required"
+                        );
                     }
                     Err(e) => {
                         eprintln!("[credentials] token retrieval failed at startup: {e}");
@@ -603,7 +647,9 @@ pub fn run() {
 async fn check_for_update_silently(app: AppHandle) {
     use tauri_plugin_updater::UpdaterExt;
     let Ok(updater) = app.updater() else { return };
-    let Ok(Some(update)) = updater.check().await else { return };
+    let Ok(Some(update)) = updater.check().await else {
+        return;
+    };
     eprintln!("[updater] new version available: {}", update.version);
     let _ = app.emit("update_available", update.version.clone());
 }

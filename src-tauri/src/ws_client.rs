@@ -20,6 +20,7 @@ macro_rules! wslog {
 
 use crate::capabilities;
 use crate::probe;
+use crate::run_executor;
 use crate::task_runner;
 
 static CLAUDE_PATH: OnceLock<String> = OnceLock::new();
@@ -694,6 +695,127 @@ async fn dispatch_action(
                     .send(Message::Text(response.to_string().into()))
                     .await;
             });
+        }
+
+        Some("start_run") => {
+            let run_id = msg["runId"].as_str().unwrap_or("").to_string();
+            let project_path = msg["projectPath"].as_str().unwrap_or("").to_string();
+            let prompt = msg["prompt"].as_str().unwrap_or("").to_string();
+            // Runtime command + arg template come from the relay's runtimeConfig.
+            let command = msg
+                .get("runtimeConfig")
+                .and_then(|c| c.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args_template: Vec<String> = msg
+                .get("runtimeConfig")
+                .and_then(|c| c.get("argsTemplate"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if run_id.is_empty() || project_path.is_empty() || prompt.is_empty() {
+                return;
+            }
+
+            let write2 = write.clone();
+            tokio::spawn(async move {
+                let (program, args) =
+                    match run_executor::build_invocation(&command, &args_template, &prompt) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let response = serde_json::json!({
+                                "type": "run_status",
+                                "runId": run_id,
+                                "status": "failed",
+                                "error": e,
+                            });
+                            let _ = write2
+                                .lock()
+                                .await
+                                .send(Message::Text(response.to_string().into()))
+                                .await;
+                            return;
+                        }
+                    };
+
+                // Tell the relay we're starting.
+                let starting = serde_json::json!({
+                    "type": "run_status",
+                    "runId": run_id,
+                    "status": "running",
+                });
+                let _ = write2
+                    .lock()
+                    .await
+                    .send(Message::Text(starting.to_string().into()))
+                    .await;
+
+                let mut rx = run_executor::spawn_run(
+                    run_id.clone(),
+                    project_path,
+                    program,
+                    args,
+                    std::collections::HashMap::new(),
+                );
+
+                while let Some(event) = rx.recv().await {
+                    let payload = match event {
+                        run_executor::RunEvent::Output { line, stream } => serde_json::json!({
+                            "type": "run_event",
+                            "runId": run_id,
+                            "event": "output",
+                            "line": line,
+                            "stream": stream,
+                        }),
+                        run_executor::RunEvent::Step { text } => serde_json::json!({
+                            "type": "run_event",
+                            "runId": run_id,
+                            "event": "step",
+                            "text": text,
+                        }),
+                        run_executor::RunEvent::Summary { text } => serde_json::json!({
+                            "type": "run_event",
+                            "runId": run_id,
+                            "event": "summary",
+                            "text": text,
+                        }),
+                        run_executor::RunEvent::Done { exit_code, status } => serde_json::json!({
+                            "type": "run_status",
+                            "runId": run_id,
+                            "status": status,
+                            "exitCode": exit_code,
+                        }),
+                        run_executor::RunEvent::Failed { error } => serde_json::json!({
+                            "type": "run_status",
+                            "runId": run_id,
+                            "status": "failed",
+                            "error": error,
+                        }),
+                    };
+                    if write2
+                        .lock()
+                        .await
+                        .send(Message::Text(payload.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Some("cancel_run") => {
+            let run_id = msg["runId"].as_str().unwrap_or("").to_string();
+            if !run_id.is_empty() {
+                run_executor::cancel_run(&run_id);
+            }
         }
 
         Some("setup_ollama") => {

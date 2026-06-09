@@ -52,7 +52,15 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
     static SETUP_OLLAMA: &[Capability] = &[FilesystemWrite, NetworkAccess, ShellExecute];
     // Probing runtime CLIs runs `<tool> --version` — shell execute only.
     static PROBE_RUNTIMES: &[Capability] = &[ShellExecute];
-    // Cancelling a task only stops work the user already started — no new access.
+    // Running a runtime is the same capability surface as a task.
+    static START_RUN: &[Capability] = &[
+        FilesystemRead,
+        FilesystemWrite,
+        ShellExecute,
+        AIExecution,
+        ArtifactUpload,
+    ];
+    // Cancelling a task/run only stops work the user already started — no new access.
     static CANCEL_TASK: &[Capability] = &[];
 
     match msg_type {
@@ -68,6 +76,8 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
         "cancel_task" => Some(CANCEL_TASK),
         "setup_ollama" => Some(SETUP_OLLAMA),
         "probe_runtimes" => Some(PROBE_RUNTIMES),
+        "start_run" => Some(START_RUN),
+        "cancel_run" => Some(CANCEL_TASK),
         _ => None,
     }
 }
@@ -314,6 +324,8 @@ mod tests {
             "run_task",
             "setup_ollama",
             "probe_runtimes",
+            "start_run",
+            "cancel_run",
         ] {
             assert!(
                 message_capabilities(t).is_some(),
