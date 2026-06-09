@@ -29,6 +29,13 @@ pub enum RunEvent {
     Step { text: String },
     /// Final summary parsed from the runtime's result event.
     Summary { text: String },
+    /// Git diff of the run's changes (computed at run end).
+    Diff {
+        files: Vec<DiffFile>,
+        additions: u32,
+        deletions: u32,
+        patch: String,
+    },
     /// Process exited (terminal). `status` is the resolved AgentRunStatus
     /// ("completed" / "failed" / "canceled").
     Done {
@@ -207,6 +214,137 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+// ── Git diff ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DiffFile {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+pub struct DiffData {
+    pub files: Vec<DiffFile>,
+    pub additions: u32,
+    pub deletions: u32,
+    pub patch: String,
+}
+
+const MAX_PATCH_BYTES: usize = 200_000;
+
+/// Parse `git diff --numstat` output: lines of `ADDS<TAB>DELS<TAB>path`.
+/// Binary files report `-` for counts → treated as 0. Returns per-file stats
+/// and the totals.
+pub fn parse_numstat(text: &str) -> (Vec<DiffFile>, u32, u32) {
+    let mut files = Vec::new();
+    let mut total_add = 0u32;
+    let mut total_del = 0u32;
+    for line in text.lines() {
+        let mut parts = line.split('\t');
+        let add = parts.next().unwrap_or("").trim();
+        let del = parts.next().unwrap_or("").trim();
+        let path = parts.collect::<Vec<_>>().join("\t");
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let additions = add.parse::<u32>().unwrap_or(0);
+        let deletions = del.parse::<u32>().unwrap_or(0);
+        total_add += additions;
+        total_del += deletions;
+        files.push(DiffFile {
+            path: path.to_string(),
+            additions,
+            deletions,
+        });
+    }
+    (files, total_add, total_del)
+}
+
+/// Redact obvious secrets that may appear in a diff line. Replaces the tail of a
+/// recognised token with asterisks so the diff is safe to send to the phone.
+pub fn redact_secret_line(line: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "ASIA",
+    ];
+    let mut out = line.to_string();
+    for p in PREFIXES {
+        if let Some(idx) = out.find(p) {
+            // Replace from the prefix to the next whitespace/quote with redaction.
+            let start = idx + p.len();
+            let end = out[start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
+                .map(|rel| start + rel)
+                .unwrap_or(out.len());
+            if end > start {
+                out.replace_range(start..end, "***REDACTED***");
+            }
+        }
+    }
+    if out.contains("PRIVATE KEY-----") {
+        // Don't ship private key bodies; keep just the marker line.
+        if out.trim_start_matches(['+', '-', ' ']).starts_with("-----") {
+            // header/footer line is fine
+        } else {
+            out = format!("{} ***REDACTED PRIVATE KEY***", &out[..out.len().min(1)]);
+        }
+    }
+    out
+}
+
+fn redact_and_truncate(patch: &str) -> String {
+    let redacted: String = patch
+        .lines()
+        .map(redact_secret_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if redacted.len() > MAX_PATCH_BYTES {
+        let mut cut = MAX_PATCH_BYTES;
+        while !redacted.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n… diff truncated …", &redacted[..cut])
+    } else {
+        redacted
+    }
+}
+
+fn run_git(project_path: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(project_path).args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    match cmd.output() {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
+        _ => None,
+    }
+}
+
+/// Compute the run's git diff vs HEAD. Returns None if the project isn't a git
+/// repo or nothing changed.
+pub fn compute_git_diff(project_path: &str) -> Option<DiffData> {
+    let numstat = run_git(project_path, &["diff", "HEAD", "--numstat"])?;
+    let (files, additions, deletions) = parse_numstat(&numstat);
+    if files.is_empty() {
+        return None;
+    }
+    let patch_raw = run_git(project_path, &["diff", "HEAD"]).unwrap_or_default();
+    Some(DiffData {
+        files,
+        additions,
+        deletions,
+        patch: redact_and_truncate(&patch_raw),
+    })
+}
+
 // ── Scoped secret grants ────────────────────────────────────────────────────
 //
 // Secrets the user approved for a specific run, delivered by the relay over the
@@ -364,6 +502,20 @@ pub fn spawn_run(
         let _ = stdout_handle.join();
         let _ = stderr_handle.join();
         let canceled = cancel.load(Ordering::SeqCst);
+
+        // Compute the run's git diff and stream it before the terminal status, so
+        // the phone can review changes. Skipped on cancel.
+        if !canceled {
+            if let Some(diff) = compute_git_diff(&project_path) {
+                let _ = tx.blocking_send(RunEvent::Diff {
+                    files: diff.files,
+                    additions: diff.additions,
+                    deletions: diff.deletions,
+                    patch: diff.patch,
+                });
+            }
+        }
+
         runs().lock().unwrap().remove(&run_id);
         clear_secret_grants(&run_id);
 
@@ -466,6 +618,37 @@ mod tests {
     #[test]
     fn cancel_unknown_run_returns_false() {
         assert!(!cancel_run("no-such-run"));
+    }
+
+    #[test]
+    fn parse_numstat_reads_counts_and_totals() {
+        let text = "3\t1\tsrc/a.ts\n10\t0\tsrc/b.ts\n-\t-\tlogo.png\n";
+        let (files, add, del) = parse_numstat(text);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "src/a.ts");
+        assert_eq!(files[0].additions, 3);
+        assert_eq!(files[0].deletions, 1);
+        assert_eq!(files[2].additions, 0); // binary
+        assert_eq!(add, 13);
+        assert_eq!(del, 1);
+    }
+
+    #[test]
+    fn parse_numstat_empty_is_empty() {
+        let (files, add, del) = parse_numstat("\n  \n");
+        assert!(files.is_empty());
+        assert_eq!((add, del), (0, 0));
+    }
+
+    #[test]
+    fn redact_secret_line_masks_tokens() {
+        assert!(
+            redact_secret_line("+const t = \"ghp_abcdEFGH1234\"").contains("ghp_***REDACTED***")
+        );
+        assert!(!redact_secret_line("+const t = \"ghp_abcdEFGH1234\"").contains("abcdEFGH1234"));
+        assert!(redact_secret_line("+key = sk-livesecret123").contains("sk-***REDACTED***"));
+        // Ordinary code is untouched.
+        assert_eq!(redact_secret_line("+const x = 42;"), "+const x = 42;");
     }
 
     #[test]

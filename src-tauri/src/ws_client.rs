@@ -785,6 +785,20 @@ async fn dispatch_action(
                             "event": "summary",
                             "text": text,
                         }),
+                        run_executor::RunEvent::Diff {
+                            files,
+                            additions,
+                            deletions,
+                            patch,
+                        } => serde_json::json!({
+                            "type": "run_event",
+                            "runId": run_id,
+                            "event": "diff",
+                            "files": files,
+                            "additions": additions,
+                            "deletions": deletions,
+                            "patch": patch,
+                        }),
                         run_executor::RunEvent::Done { exit_code, status } => serde_json::json!({
                             "type": "run_status",
                             "runId": run_id,
