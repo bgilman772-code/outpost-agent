@@ -701,6 +701,13 @@ async fn dispatch_action(
             let run_id = msg["runId"].as_str().unwrap_or("").to_string();
             let project_path = msg["projectPath"].as_str().unwrap_or("").to_string();
             let prompt = msg["prompt"].as_str().unwrap_or("").to_string();
+            let runtime = msg["runtime"].as_str().unwrap_or("").to_string();
+            let permission_profile_id = msg
+                .get("permissionProfile")
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("balanced")
+                .to_string();
             // Runtime command + arg template come from the relay's runtimeConfig.
             let command = msg
                 .get("runtimeConfig")
@@ -725,7 +732,7 @@ async fn dispatch_action(
 
             let write2 = write.clone();
             tokio::spawn(async move {
-                let (program, args) =
+                let (program, mut args) =
                     match run_executor::build_invocation(&command, &args_template, &prompt) {
                         Ok(v) => v,
                         Err(e) => {
@@ -743,6 +750,22 @@ async fn dispatch_action(
                             return;
                         }
                     };
+                if let Err(e) =
+                    run_executor::apply_runtime_policy(&runtime, &permission_profile_id, &mut args)
+                {
+                    let response = serde_json::json!({
+                        "type": "run_status",
+                        "runId": run_id,
+                        "status": "failed",
+                        "error": e,
+                    });
+                    let _ = write2
+                        .lock()
+                        .await
+                        .send(Message::Text(response.to_string().into()))
+                        .await;
+                    return;
+                }
 
                 // Tell the relay we're starting.
                 let starting = serde_json::json!({
@@ -770,20 +793,20 @@ async fn dispatch_action(
                             "type": "run_event",
                             "runId": run_id,
                             "event": "output",
-                            "line": line,
+                            "line": run_executor::redact_run_output(&run_id, &line),
                             "stream": stream,
                         }),
                         run_executor::RunEvent::Step { text } => serde_json::json!({
                             "type": "run_event",
                             "runId": run_id,
                             "event": "step",
-                            "text": text,
+                            "text": run_executor::redact_run_output(&run_id, &text),
                         }),
                         run_executor::RunEvent::Summary { text } => serde_json::json!({
                             "type": "run_event",
                             "runId": run_id,
                             "event": "summary",
-                            "text": text,
+                            "text": run_executor::redact_run_output(&run_id, &text),
                         }),
                         run_executor::RunEvent::Diff {
                             files,
