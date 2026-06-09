@@ -62,6 +62,9 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
     ];
     // Cancelling a task/run only stops work the user already started — no new access.
     static CANCEL_TASK: &[Capability] = &[];
+    // Receiving a user-approved secret grants no machine capability — it only
+    // delivers a value the user already authorized for a specific run.
+    static SECRET_GRANT: &[Capability] = &[];
 
     match msg_type {
         "registered" => Some(NONE),
@@ -78,6 +81,7 @@ pub fn message_capabilities(msg_type: &str) -> Option<&'static [Capability]> {
         "probe_runtimes" => Some(PROBE_RUNTIMES),
         "start_run" => Some(START_RUN),
         "cancel_run" => Some(CANCEL_TASK),
+        "secret_grant" => Some(SECRET_GRANT),
         _ => None,
     }
 }
@@ -326,6 +330,7 @@ mod tests {
             "probe_runtimes",
             "start_run",
             "cancel_run",
+            "secret_grant",
         ] {
             assert!(
                 message_capabilities(t).is_some(),

@@ -818,6 +818,18 @@ async fn dispatch_action(
             }
         }
 
+        Some("secret_grant") => {
+            // A user-approved secret for a run. Store it (value never logged) so
+            // the run can use it. The relay only sends this after phone approval.
+            let run_id = msg["runId"].as_str().unwrap_or("").to_string();
+            let secret_name = msg["secretName"].as_str().unwrap_or("").to_string();
+            let value = msg["value"].as_str().unwrap_or("").to_string();
+            if !run_id.is_empty() && !secret_name.is_empty() && !value.is_empty() {
+                run_executor::store_secret_grant(&run_id, &secret_name, &value);
+                wslog!("secret_grant stored for run {} ({})", run_id, secret_name);
+            }
+        }
+
         Some("setup_ollama") => {
             let request_id = msg["requestId"].as_str().unwrap_or("").to_string();
             let model_id = msg["modelId"].as_str().unwrap_or("").to_string();

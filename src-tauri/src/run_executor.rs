@@ -207,6 +207,43 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+// ── Scoped secret grants ────────────────────────────────────────────────────
+//
+// Secrets the user approved for a specific run, delivered by the relay over the
+// WS. Held only in memory, keyed by run id, and cleared when the run ends. The
+// value is never logged. (Injecting a granted secret into an already-running
+// runtime needs runtime-specific hooks; this is the receiving half.)
+
+static SECRETS: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+
+fn secrets() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    SECRETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Store a secret granted to a run. Logs the NAME only, never the value.
+pub fn store_secret_grant(run_id: &str, name: &str, value: &str) {
+    secrets()
+        .lock()
+        .unwrap()
+        .entry(run_id.to_string())
+        .or_default()
+        .insert(name.to_string(), value.to_string());
+}
+
+/// Secrets currently granted to a run (name → value).
+pub fn secret_grants_for(run_id: &str) -> HashMap<String, String> {
+    secrets()
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn clear_secret_grants(run_id: &str) {
+    secrets().lock().unwrap().remove(run_id);
+}
+
 // ── Execution ───────────────────────────────────────────────────────────────
 
 /// Spawn a run: validate the project path, start `program args` in it, and
@@ -252,6 +289,11 @@ pub fn spawn_run(
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
         for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        // Apply any secrets already granted to this run (name → value). Values
+        // are never logged.
+        for (k, v) in secret_grants_for(&run_id) {
             cmd.env(k, v);
         }
         #[cfg(target_os = "windows")]
@@ -323,6 +365,7 @@ pub fn spawn_run(
         let _ = stderr_handle.join();
         let canceled = cancel.load(Ordering::SeqCst);
         runs().lock().unwrap().remove(&run_id);
+        clear_secret_grants(&run_id);
 
         match status {
             Ok(s) => {
@@ -423,5 +466,23 @@ mod tests {
     #[test]
     fn cancel_unknown_run_returns_false() {
         assert!(!cancel_run("no-such-run"));
+    }
+
+    #[test]
+    fn secret_grants_are_stored_and_cleared_per_run() {
+        let run = "run-secret-test";
+        assert!(secret_grants_for(run).is_empty());
+        store_secret_grant(run, "GITHUB_TOKEN", "ghp_x");
+        store_secret_grant(run, "VERCEL_TOKEN", "vc_y");
+        let grants = secret_grants_for(run);
+        assert_eq!(
+            grants.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp_x")
+        );
+        assert_eq!(grants.len(), 2);
+        // A different run sees nothing.
+        assert!(secret_grants_for("other-run").is_empty());
+        clear_secret_grants(run);
+        assert!(secret_grants_for(run).is_empty());
     }
 }
