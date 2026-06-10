@@ -709,12 +709,20 @@ async fn dispatch_action(
                 .unwrap_or("balanced")
                 .to_string();
             // Runtime command + arg template come from the relay's runtimeConfig.
-            let command = msg
+            // "claude" is resolved to a real executable path: on Windows the npm
+            // install is a .cmd shim, which Command::new can't spawn by bare name
+            // even though `cmd /C claude --version` (runtime detection) finds it.
+            let command_raw = msg
                 .get("runtimeConfig")
                 .and_then(|c| c.get("command"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let command = if command_raw == "claude" {
+                get_claude_path()
+            } else {
+                command_raw
+            };
             let args_template: Vec<String> = msg
                 .get("runtimeConfig")
                 .and_then(|c| c.get("argsTemplate"))

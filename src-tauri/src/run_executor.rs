@@ -469,8 +469,14 @@ fn clear_secret_grants(run_id: &str) {
 pub fn redact_run_output(run_id: &str, line: &str) -> String {
     let mut redacted = redact_secret_line(line);
     for value in secret_grants_for(run_id).values() {
-        if !value.is_empty() {
-            redacted = redacted.replace(value, "***REDACTED***");
+        // Output and patches are redacted line by line, so a multi-line granted
+        // value (PEM key, JSON blob) never matches whole — match each of its
+        // lines too.
+        for fragment in value.lines() {
+            let fragment = fragment.trim();
+            if fragment.len() >= 4 {
+                redacted = redacted.replace(fragment, "***REDACTED***");
+            }
         }
     }
     redacted
@@ -886,6 +892,19 @@ mod tests {
         store_secret_grant(run, "CUSTOM_TOKEN", "totally-unknown-secret-format");
         let output = redact_run_output(run, "token=totally-unknown-secret-format");
         assert_eq!(output, "token=***REDACTED***");
+        clear_secret_grants(run);
+    }
+
+    #[test]
+    fn run_output_redacts_each_line_of_multiline_secret() {
+        let run = "run-multiline-secret";
+        store_secret_grant(
+            run,
+            "SERVICE_KEY",
+            "-----BEGIN PRIVATE KEY-----\nabc123Secret\n-----END PRIVATE KEY-----",
+        );
+        let leaked = redact_run_output(run, "+abc123Secret");
+        assert!(!leaked.contains("abc123Secret"));
         clear_secret_grants(run);
     }
 
