@@ -222,13 +222,14 @@ fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .spawn();
-        let pid_str = pid.to_string();
+        // spawn_run puts the runtime in its own process group (pgid == pid), so
+        // signaling -PID reaches the whole tree — a coding agent forks compilers,
+        // test runners, and shells that a parent-only TERM would orphan.
+        let group = format!("-{pid}");
+        let _ = Command::new("kill").args(["-TERM", "--", &group]).spawn();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(3));
-            let _ = Command::new("kill").args(["-KILL", &pid_str]).spawn();
+            let _ = Command::new("kill").args(["-KILL", "--", &group]).spawn();
         });
     }
 }
@@ -608,6 +609,13 @@ pub fn spawn_run(
             }
             #[cfg(target_os = "windows")]
             cmd.creation_flags(CREATE_NO_WINDOW);
+            // New process group on Unix so cancel can signal the entire tree
+            // (kill -TERM -- -PID), not just the direct child.
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
 
             let mut child = match cmd.spawn() {
                 Ok(c) => c,

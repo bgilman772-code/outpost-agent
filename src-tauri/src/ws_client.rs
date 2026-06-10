@@ -1038,26 +1038,11 @@ async fn dispatch_action(
             let use_wsl = msg["useWsl"].as_bool().unwrap_or(false);
             let wsl_distro = msg["wslDistro"].as_str().map(|s| s.to_string());
             let is_code_task = msg["isCodeTask"].as_bool().unwrap_or(false);
-            // Vault secrets injected by relay — set as env vars so tasks can call
-            // tools that read VERCEL_TOKEN, GITHUB_TOKEN, etc. from the environment.
-            let vault_secrets: std::collections::HashMap<String, String> = msg["vaultSecrets"]
-                .as_object()
-                .map(|map| {
-                    map.iter()
-                        .filter_map(|(k, v)| {
-                            // Guard: only valid env-var identifiers pass through.
-                            let safe = k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                                && !k.is_empty()
-                                && k.len() <= 128;
-                            if safe {
-                                v.as_str().map(|s| (k.clone(), s.to_string()))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Bulk vault-secret injection was removed: legacy tasks no longer
+            // receive implicit secrets. Secrets reach a process only through
+            // per-run, user-approved grants on the supervised run path.
+            let vault_secrets: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             if task_id.is_empty() || project_path.is_empty() || prompt.is_empty() {
                 return;
